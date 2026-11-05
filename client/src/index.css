@@ -1,0 +1,31 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  html { -webkit-tap-highlight-color: transparent; }
+  body { @apply bg-ink-50 text-ink-900 font-sans antialiased; }
+  h1, h2, h3 { @apply tracking-tight; }
+  ::selection { @apply bg-brand-200 text-ink-900; }
+}
+
+@layer components {
+  .input {
+    @apply block w-full rounded-lg border border-ink-200 bg-white px-3 py-2 text-sm text-ink-900 shadow-sm
+      placeholder:text-ink-400 focus:border-brand-500 focus:outline-none focus:ring-2 focus:ring-brand-500/20
+      disabled:cursor-not-allowed disabled:bg-ink-100;
+  }
+  .label { @apply mb-1 block text-xs font-semibold uppercase tracking-wide text-ink-500; }
+  .card { @apply rounded-2xl border border-ink-200/70 bg-white shadow-soft; }
+  .chip { @apply inline-flex items-center gap-1 rounded-full px-2.5 py-0.5 text-xs font-medium; }
+  .link { @apply font-medium text-brand-700 hover:text-brand-800 hover:underline; }
+  .scrollbar-thin { scrollbar-width: thin; }
+}
+
+.veg-dot, .nonveg-dot, .vegan-dot { @apply inline-flex h-4 w-4 items-center justify-center rounded-sm border-2; }
+.veg-dot { @apply border-green-600; }
+.veg-dot::after { content: ''; @apply h-1.5 w-1.5 rounded-full bg-green-600; }
+.nonveg-dot { @apply border-red-700; }
+.nonveg-dot::after { content: ''; @apply h-0 w-0 border-x-[4px] border-b-[7px] border-x-transparent border-b-red-700; }
+.vegan-dot { @apply border-emerald-500; }
+.vegan-dot::after { content: ''; @apply h-1.5 w-1.5 rounded-full bg-emerald-500; }
