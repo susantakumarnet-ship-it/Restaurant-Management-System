@@ -12,7 +12,7 @@ A full-stack restaurant platform with two portals:
 | Database | MongoDB (Atlas in production) with unique/partial indexes, multi-document transactions and FK-style cascade rules in the data layer. Dev and test start a local MongoDB automatically, so nothing needs installing. |
 | Integrations | Razorpay (with a built-in mock gateway), SMTP email via nodemailer, Twilio SMS, WhatsApp Cloud API, Google Sign-In, Google Maps embeds |
 | Documents | PDF invoices, booking confirmations and report PDFs (pdfkit); Excel exports (exceljs) |
-| Tests | Vitest + Supertest. 89 backend integration tests on a real MongoDB replica set (in-memory), plus frontend unit tests. |
+| Tests | Vitest + Supertest. 94 backend integration tests on a real MongoDB replica set (in-memory), plus frontend unit tests. |
 
 ---
 
@@ -190,7 +190,7 @@ The image builds the React app and serves it from the API, so a single container
 ## 9. Tests
 
 ```bash
-cd server && npm test   # 89 integration tests, fresh in-memory MongoDB replica set per file
+cd server && npm test   # 94 integration tests, fresh in-memory MongoDB replica set per file
 cd client && npm test   # unit tests (formatting, form/payload mapping)
 cd client && npm run build   # type-check + production build
 ```
@@ -200,6 +200,7 @@ Backend coverage:
 - **Authorization:** RBAC, tenant isolation, role-permission edits.
 - **Booking engine:** slots, holidays, capacity, buffer, concurrency, modify, cancel/deadline, walk-in, multiple tables.
 - **Orders and payments:** pricing, coupons and limits, GST, mock gateway, invoices, kitchen flow, loyalty, partial payments, refunds, cancellations.
+- **Concurrency:** coupon limits, double payment completion, overpayment, stock never negative, duplicate registration.
 - **Admin:** CRUD validation, inventory, staff accounts and shifts, dashboard, report exports, audit-log redaction.
 
 ---

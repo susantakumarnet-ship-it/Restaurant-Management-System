@@ -132,18 +132,19 @@ r.get(
         db.aggregate('reservations', [
           { $match: { branch_id: b, booking_date: { $gte: addDays(today, -30) } } },
           { $group: { _id: '$status', count: { $sum: 1 } } },
-          { $sort: { count: -1 } },
+          { $sort: { count: -1, _id: 1 } },
           { $project: { _id: 0, status: '$_id', count: 1 } },
         ]),
         db.aggregate('orders', [
           { $match: { branch_id: b, created_at: { $gt: since30 } } },
           { $group: { _id: '$status', count: { $sum: 1 } } },
-          { $sort: { count: -1 } },
+          { $sort: { count: -1, _id: 1 } },
           { $project: { _id: 0, status: '$_id', count: 1 } },
         ]),
         db.aggregate('orders', [
           { $match: { branch_id: b, status: { $ne: 'cancelled' }, created_at: { $gt: since30 } } },
           { $group: { _id: '$order_type', count: { $sum: 1 }, revenue: { $sum: '$total' } } },
+          { $sort: { _id: 1 } },
           { $project: { _id: 0, order_type: '$_id', count: 1, revenue: 1 } },
         ]),
         db.find(
