@@ -12,6 +12,7 @@
     "seed": "node src/db/seed.js",
     "db:reset": "node src/db/seed.js --reset",
     "db:backup": "node scripts/backup.js",
+    "sql": "node scripts/sql.js",
     "test": "vitest run",
     "test:watch": "vitest"
   },
