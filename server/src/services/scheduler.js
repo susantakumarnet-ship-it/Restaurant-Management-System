@@ -5,16 +5,26 @@ import { notify } from './notify.js';
 /** Sends booking reminders ~3 hours before the reservation. Runs every 5 minutes. */
 export async function sendBookingReminders() {
   const now = new Date();
-  const rows = await db.many(
-    `SELECT r.id, r.booking_code, r.start_at, r.guests, r.email, r.phone, cu.user_id, b.id AS branch_id, rest.name AS restaurant_name, b.name AS branch_name
-       FROM reservations r JOIN restaurant_branches b ON b.id = r.branch_id JOIN restaurants rest ON rest.id = b.restaurant_id
-       LEFT JOIN customers cu ON cu.id = r.customer_id
-      WHERE r.status = 'confirmed' AND r.reminder_sent_at IS NULL AND r.start_at > $1::timestamp AND r.start_at <= $2::timestamp
-      LIMIT 200`,
-    [localIso(now), localIso(addMinutes(now, 180))]
+  const found = await db.find(
+    'reservations',
+    { status: 'confirmed', reminder_sent_at: null, start_at: { $gt: localIso(now), $lte: localIso(addMinutes(now, 180)) } },
+    { limit: 200, projection: { id: 1, booking_code: 1, start_at: 1, guests: 1, email: 1, phone: 1, branch_id: 1, customer_id: 1 } }
   );
+  const branches = await db.mapByIds('restaurant_branches', found.map((r) => r.branch_id), { projection: { name: 1, restaurant_id: 1 } });
+  const restaurants = await db.mapByIds('restaurants', [...branches.values()].map((b) => b.restaurant_id), { projection: { name: 1 } });
+  const customers = await db.mapByIds('customers', found.map((r) => r.customer_id), { projection: { user_id: 1 } });
+  const rows = [];
+  for (const r of found) {
+    const b = branches.get(r.branch_id);
+    const rest = b && restaurants.get(b.restaurant_id);
+    if (!b || !rest) continue; // inner joins
+    rows.push({
+      id: r.id, booking_code: r.booking_code, start_at: r.start_at, guests: r.guests, email: r.email ?? null, phone: r.phone ?? null,
+      user_id: customers.get(r.customer_id)?.user_id ?? null, branch_id: b.id, restaurant_name: rest.name, branch_name: b.name,
+    });
+  }
   for (const r of rows) {
-    await db.query('UPDATE reservations SET reminder_sent_at = now() WHERE id = $1', [r.id]);
+    await db.update('reservations', { id: r.id }, { $set: { reminder_sent_at: new Date() } });
     await notify({
       userId: r.user_id,
       branchId: r.branch_id,

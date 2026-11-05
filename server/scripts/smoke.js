@@ -6,7 +6,7 @@ const { seed } = await import('../src/db/seed.js');
 const { createApp } = await import('../src/app.js');
 
 let t = Date.now();
-await initDb({ url: '', dir: '' });
+await initDb({ uri: '', dataDir: '' });
 await migrate({ log: () => {} });
 console.log('migrate', Date.now() - t, 'ms');
 t = Date.now();

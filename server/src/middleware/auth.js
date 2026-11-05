@@ -13,19 +13,43 @@ export const clearAuthCache = (userId) => (userId ? cache.delete(userId) : cache
 export async function loadAuthUser(id) {
   const hit = cache.get(id);
   if (hit && hit.at > Date.now() - TTL) return hit.user;
-  const user = await db.one(
-    `SELECT u.id, u.name, u.email, u.phone, u.avatar_url, u.is_active, u.email_verified, u.phone_verified,
-            u.restaurant_id, u.branch_id, r.name AS role, r.display_name AS role_name, r.is_staff,
-            COALESCE((SELECT array_agg(p.code) FROM role_permissions rp JOIN permissions p ON p.id = rp.permission_id
-                      WHERE rp.role_id = r.id), '{}') AS permissions,
-            c.id AS customer_id, c.status AS customer_status
-       FROM users u JOIN roles r ON r.id = u.role_id
-       LEFT JOIN customers c ON c.user_id = u.id
-      WHERE u.id = $1`,
-    [id]
-  );
+  const user = await fetchAuthUser(id);
   if (user) cache.set(id, { user, at: Date.now() });
   return user;
+}
+
+async function fetchAuthUser(id) {
+  const uid = Number(id);
+  if (!Number.isFinite(uid)) return null;
+  const u = await db.findOne('users', { id: uid }, {
+    projection: { id: 1, name: 1, email: 1, phone: 1, avatar_url: 1, is_active: 1, email_verified: 1, phone_verified: 1, restaurant_id: 1, branch_id: 1, role_id: 1 },
+  });
+  if (!u) return null;
+  const r = await db.byId('roles', u.role_id, { projection: { id: 1, name: 1, display_name: 1, is_staff: 1 } });
+  if (!r) return null; // inner join on roles
+  const [rps, c] = await Promise.all([
+    db.find('role_permissions', { role_id: r.id }, { projection: { permission_id: 1 } }),
+    db.findOne('customers', { user_id: u.id }, { projection: { id: 1, status: 1 } }),
+  ]);
+  const perms = rps.length ? await db.find('permissions', { id: { $in: rps.map((x) => x.permission_id) } }, { projection: { code: 1 } }) : [];
+  return {
+    id: u.id,
+    name: u.name,
+    email: u.email,
+    phone: u.phone ?? null,
+    avatar_url: u.avatar_url ?? null,
+    is_active: u.is_active,
+    email_verified: u.email_verified,
+    phone_verified: u.phone_verified,
+    restaurant_id: u.restaurant_id ?? null,
+    branch_id: u.branch_id ?? null,
+    role: r.name,
+    role_name: r.display_name,
+    is_staff: r.is_staff,
+    permissions: perms.map((p) => p.code),
+    customer_id: c ? c.id : null,
+    customer_status: c ? c.status : null,
+  };
 }
 
 async function resolveUser(req) {
@@ -97,12 +121,10 @@ export const branchScope = async (req, _res, next) => {
     const raw = req.headers['x-branch-id'] || req.query.branchId;
     const branchId = parseInt(raw, 10);
     if (!branchId) throw badRequest('Branch not selected (X-Branch-Id header required)');
-    const branch = await db.one(
-      `SELECT b.*, r.name AS restaurant_name, r.gstin, r.logo_url, r.is_active AS restaurant_active
-         FROM restaurant_branches b JOIN restaurants r ON r.id = b.restaurant_id WHERE b.id = $1`,
-      [branchId]
-    );
-    if (!branch) throw notFound('Branch');
+    const b = await db.byId('restaurant_branches', branchId);
+    const r = b ? await db.byId('restaurants', b.restaurant_id, { projection: { name: 1, gstin: 1, logo_url: 1, is_active: 1 } }) : null;
+    if (!b || !r) throw notFound('Branch');
+    const branch = { ...b, restaurant_name: r.name, gstin: r.gstin ?? null, logo_url: r.logo_url ?? null, restaurant_active: r.is_active };
     assertBranchAccess(req.user, branch);
     req.branch = branch;
     req.branchId = branch.id;

@@ -1,6 +1,6 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { generateSlots, dateClosedReason } from '../src/services/booking.js';
-import { client, daysFromNow, db, login, setupApp, teardown, tomorrow } from './helpers.js';
+import { client, customerByEmail, daysFromNow, db, login, setupApp, teardown, tomorrow } from './helpers.js';
 
 let app, fx, cust, cust2, admin;
 const booking = (over = {}) => ({ branch_id: fx.A.branchId, customer_name: 'Test Guest', phone: '9876500001', email: 'cust@test.com', date: tomorrow(), time: '19:00', guests: 2, ...over });
@@ -68,11 +68,8 @@ describe('Availability & double-booking prevention', () => {
     const statuses = attempts.map((r) => r.status).sort();
     expect(statuses.filter((s) => s === 201)).toHaveLength(1);
     expect(statuses.filter((s) => s === 409)).toHaveLength(5);
-    const rows = await db.many(
-      `SELECT COUNT(*) AS n FROM reservation_tables WHERE table_id = $1 AND active AND start_at::date = $2::date`,
-      [fx.tables.t4, daysFromNow(2)]
-    );
-    expect(rows[0].n).toBe(1);
+    const n = await db.count('reservation_tables', { table_id: fx.tables.t4, active: true, start_at: { $regex: `^${daysFromNow(2)}` } });
+    expect(n).toBe(1);
   });
 
   it('returns NO_AVAILABILITY when every fitting table is taken', async () => {
@@ -126,8 +123,7 @@ describe('Booking lifecycle', () => {
     const res = await cust.post(`/api/customer/bookings/${id}/cancel`, { reason: 'Plans changed' });
     expect(res.status).toBe(200);
     expect(res.body.status).toBe('cancelled');
-    const active = await db.one('SELECT COUNT(*) AS n FROM reservation_tables WHERE reservation_id = $1 AND active', [id]);
-    expect(active.n).toBe(0);
+    expect(await db.count('reservation_tables', { reservation_id: id, active: true })).toBe(0);
     const again = await cust2.post('/api/customer/bookings', booking({ date: daysFromNow(4), time: '19:30', guests: 4, table_ids: [fx.tables.t4], phone: '9876500002' }));
     expect(again.status).toBe(201);
   });
@@ -138,12 +134,11 @@ describe('Booking lifecycle', () => {
     const pad = (n) => String(n).padStart(2, '0');
     const iso = (d) => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}:00`;
     const end = new Date(soon.getTime() + 90 * 60000);
-    const custRow = await db.one(`SELECT c.id FROM customers c JOIN users u ON u.id = c.user_id WHERE u.email = 'cust@test.com'`);
-    const r = await db.one(
-      `INSERT INTO reservations(booking_code, branch_id, customer_id, customer_name, phone, booking_date, start_at, end_at, guests, status)
-       VALUES ('BK-SOON01',$1,$2,'X','9876500001',$3,$4,$5,2,'confirmed') RETURNING id`,
-      [fx.A.branchId, custRow.id, iso(soon).slice(0, 10), iso(soon), iso(end)]
-    );
+    const custRow = await customerByEmail('cust@test.com');
+    const r = await db.insert('reservations', {
+      booking_code: 'BK-SOON01', branch_id: fx.A.branchId, customer_id: custRow.id, customer_name: 'X', phone: '9876500001',
+      booking_date: iso(soon).slice(0, 10), start_at: iso(soon), end_at: iso(end), guests: 2, status: 'confirmed',
+    });
     const res = await cust.post(`/api/customer/bookings/${r.id}/cancel`, {});
     expect(res.status).toBe(400);
     expect(res.body.error.message).toMatch(/hour/);

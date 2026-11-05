@@ -7,10 +7,9 @@ import { startScheduler } from './services/scheduler.js';
 await initDb();
 await migrate({ log: (m) => console.log(m) });
 
-// First run on an empty embedded database: load demo data automatically.
-if (db.driver === 'pglite') {
-  const { n } = await db.one('SELECT COUNT(*) AS n FROM restaurants');
-  if (n === 0) {
+// First run on an empty local (non-Atlas) database: load demo data automatically.
+if (db.driver !== 'mongodb') {
+  if ((await db.count('restaurants')) === 0) {
     const { seed } = await import('./db/seed.js');
     console.log('Empty database detected - loading demo data...');
     await seed();

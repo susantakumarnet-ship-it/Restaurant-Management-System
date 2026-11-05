@@ -1,15 +1,28 @@
 import { Router } from 'express';
 import { z } from 'zod';
-import { db } from '../../db/index.js';
+import { db, escapeRegex } from '../../db/index.js';
 import { ah, badRequest, notFound, validate } from '../../utils/http.js';
 import { requirePerm } from '../../middleware/auth.js';
 import { ensureInvoice, recordManualPayment, refundPayment } from '../../services/payments.js';
 import { getOrder } from '../../services/orders.js';
 import { invoicePdf } from '../../services/pdf.js';
 import { crud, zs } from './crud.js';
-import { localDate } from '../../utils/common.js';
+import { ilike, localDate, parseLocal, round2 } from '../../utils/common.js';
 
 const r = Router();
+
+/** Local-day bounds for `<ts>::date >= from` / `<ts>::date <= to` (restaurant timezone). */
+const dayStart = (s) => parseLocal(String(s).slice(0, 10));
+const nextDayStart = (s) => {
+  const d = dayStart(s);
+  return new Date(d.getFullYear(), d.getMonth(), d.getDate() + 1);
+};
+function dateRange(from, to) {
+  const c = {};
+  if (from) c.$gte = dayStart(from);
+  if (to) c.$lt = nextDayStart(to);
+  return c;
+}
 
 // ================= Payments =================
 r.get(
@@ -17,32 +30,42 @@ r.get(
   requirePerm('payments.manage'),
   ah(async (req, res) => {
     const q = req.query;
-    const params = [req.branchId];
-    const where = ['p.branch_id = $1'];
-    const add = (sql, v) => {
-      params.push(v);
-      where.push(sql.replace('?', `$${params.length}`));
-    };
-    if (q.status) add('p.status = ?', q.status);
-    if (q.method) add('p.method = ?', q.method);
-    if (q.purpose) add('p.purpose = ?', q.purpose);
-    if (q.from) add('p.created_at::date >= ?::date', q.from);
-    if (q.to) add('p.created_at::date <= ?::date', q.to);
+    const filter = { branch_id: req.branchId };
+    if (q.status) filter.status = String(q.status);
+    if (q.method) filter.method = String(q.method);
+    if (q.purpose) filter.purpose = String(q.purpose);
+    if (q.from || q.to) filter.created_at = dateRange(q.from, q.to);
     if (q.q) {
-      params.push(`%${String(q.q).trim()}%`);
-      const i = params.length;
-      where.push(`(p.payment_code ILIKE $${i} OR o.order_code ILIKE $${i} OR rs.booking_code ILIKE $${i} OR p.gateway_payment_id ILIKE $${i})`);
+      const rx = ilike(q.q);
+      const [orderIds, resIds] = await Promise.all([
+        db.distinct('orders', 'id', { branch_id: req.branchId, order_code: rx }),
+        db.distinct('reservations', 'id', { branch_id: req.branchId, booking_code: rx }),
+      ]);
+      filter.$or = [{ payment_code: rx }, { gateway_payment_id: rx }, { order_id: { $in: orderIds } }, { reservation_id: { $in: resIds } }];
     }
-    const rows = await db.many(
-      `SELECT p.*, o.order_code, rs.booking_code, COALESCE(o.contact_name, rs.customer_name) AS customer_name, u.name AS recorded_by_name
-         FROM payments p LEFT JOIN orders o ON o.id = p.order_id LEFT JOIN reservations rs ON rs.id = p.reservation_id
-         LEFT JOIN users u ON u.id = p.recorded_by
-        WHERE ${where.join(' AND ')} ORDER BY p.created_at DESC LIMIT 500`,
-      params
+    const rows = await db.find('payments', filter, { sort: { created_at: -1 }, limit: 500 });
+    const [orders, resvs, users] = await Promise.all([
+      db.mapByIds('orders', rows.map((p) => p.order_id), { projection: { order_code: 1, contact_name: 1 } }),
+      db.mapByIds('reservations', rows.map((p) => p.reservation_id), { projection: { booking_code: 1, customer_name: 1 } }),
+      db.mapByIds('users', rows.map((p) => p.recorded_by), { projection: { name: 1 } }),
+    ]);
+    res.json(
+      rows.map((p) => {
+        const o = orders.get(p.order_id);
+        const rs = resvs.get(p.reservation_id);
+        return {
+          ...p,
+          order_code: o ? o.order_code : null,
+          booking_code: rs ? rs.booking_code : null,
+          customer_name: (o && o.contact_name != null ? o.contact_name : rs ? rs.customer_name : null) ?? null,
+          recorded_by_name: users.get(p.recorded_by)?.name ?? null,
+        };
+      })
     );
-    res.json(rows);
   })
 );
+
+const PAID = ['success', 'partially_refunded', 'refunded'];
 
 r.get(
   '/payments/summary',
@@ -50,20 +73,34 @@ r.get(
   ah(async (req, res) => {
     const from = req.query.from || localDate().slice(0, 8) + '01';
     const to = req.query.to || localDate();
-    res.json(
-      await db.one(
-        `SELECT COALESCE(SUM(amount) FILTER (WHERE status IN ('success','partially_refunded','refunded')),0) AS received,
-                COALESCE(SUM(refunded_amount),0) AS refunded,
-                COALESCE(SUM(amount) FILTER (WHERE status IN ('success','partially_refunded','refunded') AND method = 'cash'),0) AS cash,
-                COALESCE(SUM(amount) FILTER (WHERE status IN ('success','partially_refunded','refunded') AND method = 'upi'),0) AS upi,
-                COALESCE(SUM(amount) FILTER (WHERE status IN ('success','partially_refunded','refunded') AND method = 'card'),0) AS card,
-                COALESCE(SUM(amount) FILTER (WHERE status IN ('success','partially_refunded','refunded') AND method = 'online'),0) AS online,
-                COUNT(*) FILTER (WHERE status = 'failed') AS failed,
-                COUNT(*) FILTER (WHERE status = 'pending') AS pending
-           FROM payments WHERE branch_id = $1 AND created_at::date BETWEEN $2 AND $3`,
-        [req.branchId, from, to]
-      )
-    );
+    const paidSum = (extra) => ({ $sum: { $cond: [{ $and: [{ $in: ['$status', PAID] }, ...(extra ? [extra] : [])] }, '$amount', 0] } });
+    const [g] = await db.aggregate('payments', [
+      { $match: { branch_id: req.branchId, created_at: dateRange(from, to) } },
+      {
+        $group: {
+          _id: null,
+          received: paidSum(),
+          refunded: { $sum: { $ifNull: ['$refunded_amount', 0] } },
+          cash: paidSum({ $eq: ['$method', 'cash'] }),
+          upi: paidSum({ $eq: ['$method', 'upi'] }),
+          card: paidSum({ $eq: ['$method', 'card'] }),
+          online: paidSum({ $eq: ['$method', 'online'] }),
+          failed: { $sum: { $cond: [{ $eq: ['$status', 'failed'] }, 1, 0] } },
+          pending: { $sum: { $cond: [{ $eq: ['$status', 'pending'] }, 1, 0] } },
+        },
+      },
+    ]);
+    const s = g || {};
+    res.json({
+      received: round2(s.received || 0),
+      refunded: round2(s.refunded || 0),
+      cash: round2(s.cash || 0),
+      upi: round2(s.upi || 0),
+      card: round2(s.card || 0),
+      online: round2(s.online || 0),
+      failed: s.failed || 0,
+      pending: s.pending || 0,
+    });
   })
 );
 
@@ -102,26 +139,20 @@ r.get(
   '/invoices',
   requirePerm('payments.manage'),
   ah(async (req, res) => {
-    const params = [req.branchId];
-    let extra = '';
+    const filter = { branch_id: req.branchId };
     if (req.query.q) {
-      params.push(`%${req.query.q}%`);
-      extra += ` AND (i.invoice_number ILIKE $2 OR o.order_code ILIKE $2 OR i.customer_name ILIKE $2)`;
+      const rx = { $regex: escapeRegex(req.query.q), $options: 'i' };
+      const orderIds = await db.distinct('orders', 'id', { branch_id: req.branchId, order_code: rx });
+      filter.$or = [{ invoice_number: rx }, { customer_name: rx }, { order_id: { $in: orderIds } }];
     }
-    if (req.query.from) {
-      params.push(req.query.from);
-      extra += ` AND i.issued_at::date >= $${params.length}::date`;
-    }
-    if (req.query.to) {
-      params.push(req.query.to);
-      extra += ` AND i.issued_at::date <= $${params.length}::date`;
-    }
+    if (req.query.from || req.query.to) filter.issued_at = dateRange(req.query.from, req.query.to);
+    const rows = await db.find('invoices', filter, { sort: { issued_at: -1 }, limit: 500 });
+    const orders = await db.mapByIds('orders', rows.map((i) => i.order_id), { projection: { order_code: 1, payment_status: 1 } });
     res.json(
-      await db.many(
-        `SELECT i.*, o.order_code, o.payment_status FROM invoices i LEFT JOIN orders o ON o.id = i.order_id
-          WHERE i.branch_id = $1 ${extra} ORDER BY i.issued_at DESC LIMIT 500`,
-        params
-      )
+      rows.map((i) => {
+        const o = orders.get(i.order_id);
+        return { ...i, order_code: o ? o.order_code : null, payment_status: o ? o.payment_status : null };
+      })
     );
   })
 );
@@ -130,7 +161,7 @@ r.post(
   '/orders/:id(\\d+)/invoice',
   requirePerm('payments.manage', 'orders.manage'),
   ah(async (req, res) => {
-    const o = await db.one('SELECT id FROM orders WHERE id = $1 AND branch_id = $2', [parseInt(req.params.id, 10), req.branchId]);
+    const o = await db.findOne('orders', { id: parseInt(req.params.id, 10), branch_id: req.branchId }, { projection: { id: 1 } });
     if (!o) throw notFound('Order');
     res.json(await ensureInvoice(db, o.id));
   })
@@ -140,7 +171,7 @@ r.get(
   '/invoices/:id(\\d+)/pdf',
   requirePerm('payments.manage', 'orders.manage'),
   ah(async (req, res) => {
-    const invoice = await db.one('SELECT * FROM invoices WHERE id = $1 AND branch_id = $2', [parseInt(req.params.id, 10), req.branchId]);
+    const invoice = await db.findOne('invoices', { id: parseInt(req.params.id, 10), branch_id: req.branchId });
     if (!invoice) throw notFound('Invoice');
     if (!invoice.order_id) throw badRequest('Invoice has no order');
     const o = await getOrder(invoice.order_id);
@@ -155,10 +186,17 @@ r.use(
     table: 'coupons',
     scope: 'restaurant',
     perm: 'coupons.manage',
-    search: ['t.code', 't.title'],
-    orderBy: 't.is_active DESC, t.created_at DESC',
-    select: `t.*, t.valid_from::text AS valid_from, t.valid_to::text AS valid_to,
-      (SELECT COALESCE(SUM(o.discount),0) FROM orders o WHERE o.coupon_id = t.id AND o.status <> 'cancelled') AS total_discount_given`,
+    search: ['code', 'title'],
+    sort: { is_active: -1, created_at: -1 },
+    async enrich(rows) {
+      const ids = rows.map((c) => c.id);
+      const sums = await db.aggregate('orders', [
+        { $match: { coupon_id: { $in: ids }, status: { $ne: 'cancelled' } } },
+        { $group: { _id: '$coupon_id', n: { $sum: { $ifNull: ['$discount', 0] } } } },
+      ]);
+      const m = new Map(sums.map((x) => [x._id, x.n]));
+      return rows.map((c) => ({ ...c, total_discount_given: round2(m.get(c.id) || 0) }));
+    },
     refine: (v, ctx) => {
       if (v.discount_type === 'percent' && v.discount_value > 100) ctx.addIssue({ code: 'custom', path: ['discount_value'], message: 'Percentage cannot exceed 100' });
       if (v.valid_from && v.valid_to && v.valid_from > v.valid_to) ctx.addIssue({ code: 'custom', path: ['valid_to'], message: 'End date must be after start date' });

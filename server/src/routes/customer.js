@@ -35,6 +35,9 @@ export const bookingSchema = z.object({
     .nullable(),
 });
 
+/** Pick columns in order; missing ones become null (like SQL NULL). */
+const pick = (o, keys) => Object.fromEntries(keys.map((k) => [k, o?.[k] ?? null]));
+
 const mineOnly = (row, user, what) => {
   if (!row || row.user_id !== user.id) throw notFound(what);
   return row;
@@ -45,16 +48,31 @@ r.get(
   '/bookings',
   ah(async (req, res) => {
     if (!req.user.customer_id) return res.json([]);
-    res.json(
-      await db.many(
-        `SELECT r.id, r.booking_code, r.booking_date, r.start_at, r.end_at, r.guests, r.status, r.occasion, r.special_requests,
-                r.advance_amount, r.payment_status, r.created_at, b.name AS branch_name, rest.name AS restaurant_name,
-                COALESCE((SELECT string_agg(t.table_number, ', ') FROM reservation_tables rt JOIN tables t ON t.id = rt.table_id WHERE rt.reservation_id = r.id), '') AS tables
-           FROM reservations r JOIN restaurant_branches b ON b.id = r.branch_id JOIN restaurants rest ON rest.id = b.restaurant_id
-          WHERE r.customer_id = $1 ORDER BY r.start_at DESC`,
-        [req.user.customer_id]
-      )
-    );
+    const rows = await db.find('reservations', { customer_id: req.user.customer_id }, { sort: { start_at: -1 } });
+    const branches = await db.mapByIds('restaurant_branches', rows.map((x) => x.branch_id), { projection: { name: 1, restaurant_id: 1 } });
+    const rests = await db.mapByIds('restaurants', [...branches.values()].map((x) => x.restaurant_id), { projection: { name: 1 } });
+    const links = rows.length ? await db.find('reservation_tables', { reservation_id: { $in: rows.map((x) => x.id) } }, { projection: { reservation_id: 1, table_id: 1 } }) : [];
+    const tables = await db.mapByIds('tables', links.map((x) => x.table_id), { projection: { table_number: 1 } });
+    const tablesBy = new Map();
+    for (const l of links) {
+      const t = tables.get(l.table_id);
+      if (!t) continue;
+      if (!tablesBy.has(l.reservation_id)) tablesBy.set(l.reservation_id, []);
+      tablesBy.get(l.reservation_id).push(t.table_number);
+    }
+    const out = [];
+    for (const rv of rows) {
+      const b = branches.get(rv.branch_id);
+      const rest = b && rests.get(b.restaurant_id);
+      if (!b || !rest) continue; // inner JOINs
+      out.push({
+        ...pick(rv, ['id', 'booking_code', 'booking_date', 'start_at', 'end_at', 'guests', 'status', 'occasion', 'special_requests', 'advance_amount', 'payment_status', 'created_at']),
+        branch_name: b.name ?? null,
+        restaurant_name: rest.name ?? null,
+        tables: (tablesBy.get(rv.id) || []).join(', '),
+      });
+    }
+    res.json(out);
   })
 );
 
@@ -62,9 +80,13 @@ r.get(
   '/bookings/:id',
   ah(async (req, res) => {
     const b = mineOnly(await getReservation(parseInt(req.params.id, 10) || 0).catch(() => null), req.user, 'Booking');
-    const history = await db.many('SELECT from_status, to_status, note, created_at FROM reservation_status_history WHERE reservation_id = $1 ORDER BY id', [b.id]);
-    const cfg = await db.one('SELECT cancellation_deadline_hours FROM restaurant_settings WHERE branch_id = $1', [b.branch_id]);
-    const orders = await db.many('SELECT id, order_code, total, status FROM orders WHERE reservation_id = $1', [b.id]);
+    const history = (
+      await db.find('reservation_status_history', { reservation_id: b.id }, { sort: { id: 1 }, projection: { from_status: 1, to_status: 1, note: 1, created_at: 1 } })
+    ).map((h) => pick(h, ['from_status', 'to_status', 'note', 'created_at']));
+    const cfg = await db.findOne('restaurant_settings', { branch_id: b.branch_id }, { projection: { cancellation_deadline_hours: 1 } });
+    const orders = (
+      await db.find('orders', { reservation_id: b.id }, { sort: { id: 1 }, projection: { id: 1, order_code: 1, total: 1, status: 1 } })
+    ).map((o) => pick(o, ['id', 'order_code', 'total', 'status']));
     res.json({ ...b, history, orders, cancellation_deadline_hours: cfg?.cancellation_deadline_hours });
   })
 );
@@ -129,16 +151,30 @@ r.get(
   '/orders',
   ah(async (req, res) => {
     if (!req.user.customer_id) return res.json([]);
-    res.json(
-      await db.many(
-        `SELECT o.id, o.order_code, o.order_type, o.status, o.payment_status, o.payment_method, o.total, o.created_at,
-                b.name AS branch_name, (SELECT COUNT(*) FROM order_items oi WHERE oi.order_id = o.id) AS item_count,
-                (SELECT string_agg(oi.name || ' x' || oi.quantity, ', ') FROM order_items oi WHERE oi.order_id = o.id) AS summary
-           FROM orders o JOIN restaurant_branches b ON b.id = o.branch_id
-          WHERE o.customer_id = $1 ORDER BY o.created_at DESC`,
-        [req.user.customer_id]
-      )
-    );
+    const rows = await db.find('orders', { customer_id: req.user.customer_id }, { sort: { created_at: -1 } });
+    const branches = await db.mapByIds('restaurant_branches', rows.map((x) => x.branch_id), { projection: { name: 1 } });
+    const items = rows.length
+      ? await db.find('order_items', { order_id: { $in: rows.map((x) => x.id) } }, { sort: { id: 1 }, projection: { order_id: 1, name: 1, quantity: 1 } })
+      : [];
+    const itemsBy = new Map();
+    for (const it of items) {
+      if (!itemsBy.has(it.order_id)) itemsBy.set(it.order_id, []);
+      itemsBy.get(it.order_id).push(it);
+    }
+    const out = [];
+    for (const o of rows) {
+      const b = branches.get(o.branch_id);
+      if (!b) continue; // inner JOIN
+      const its = itemsBy.get(o.id) || [];
+      out.push({
+        ...pick(o, ['id', 'order_code', 'order_type', 'status', 'payment_status', 'payment_method', 'total', 'created_at']),
+        branch_name: b.name ?? null,
+        item_count: its.length,
+        // string_agg over zero rows is NULL (no COALESCE in the original query)
+        summary: its.length ? its.map((it) => `${it.name} x${it.quantity}`).join(', ') : null,
+      });
+    }
+    res.json(out);
   })
 );
 
@@ -146,12 +182,10 @@ r.get(
   '/orders/:id',
   ah(async (req, res) => {
     const o = mineOnly(await getOrder(parseInt(req.params.id, 10) || 0).catch(() => null), req.user, 'Order');
-    const payments = await db.many(
-      `SELECT payment_code, amount, method, status, refunded_amount, paid_at, created_at FROM payments WHERE order_id = $1 ORDER BY id`,
-      [o.id]
-    );
-    const reviewed = await db.many('SELECT food_item_id FROM reviews WHERE order_id = $1 AND user_id = $2', [o.id, req.user.id]);
-    res.json({ ...o, payments, reviewed_items: reviewed.map((x) => x.food_item_id) });
+    const PAY_COLS = ['payment_code', 'amount', 'method', 'status', 'refunded_amount', 'paid_at', 'created_at'];
+    const payments = (await db.find('payments', { order_id: o.id }, { sort: { id: 1 } })).map((p) => pick(p, PAY_COLS));
+    const reviewed = await db.find('reviews', { order_id: o.id, user_id: req.user.id }, { projection: { food_item_id: 1 } });
+    res.json({ ...o, payments, reviewed_items: reviewed.map((x) => x.food_item_id ?? null) });
   })
 );
 
@@ -211,14 +245,14 @@ r.post(
 r.get(
   '/payments',
   ah(async (req, res) => {
+    const rows = await db.find('payments', { user_id: req.user.id }, { sort: { created_at: -1 } });
+    const orders = await db.mapByIds('orders', rows.map((p) => p.order_id), { projection: { order_code: 1 } });
+    const resv = await db.mapByIds('reservations', rows.map((p) => p.reservation_id), { projection: { booking_code: 1 } });
     res.json(
-      await db.many(
-        `SELECT p.id, p.payment_code, p.amount, p.method, p.status, p.purpose, p.refunded_amount, p.created_at,
-                COALESCE(o.order_code, rs.booking_code) AS reference
-           FROM payments p LEFT JOIN orders o ON o.id = p.order_id LEFT JOIN reservations rs ON rs.id = p.reservation_id
-          WHERE p.user_id = $1 ORDER BY p.created_at DESC`,
-        [req.user.id]
-      )
+      rows.map((p) => ({
+        ...pick(p, ['id', 'payment_code', 'amount', 'method', 'status', 'purpose', 'refunded_amount', 'created_at']),
+        reference: orders.get(p.order_id)?.order_code ?? resv.get(p.reservation_id)?.booking_code ?? null,
+      }))
     );
   })
 );
@@ -227,13 +261,13 @@ r.get(
 r.get(
   '/reviews',
   ah(async (req, res) => {
+    const rows = await db.find('reviews', { user_id: req.user.id }, { sort: { created_at: -1 } });
+    const foods = await db.mapByIds('food_items', rows.map((x) => x.food_item_id), { projection: { name: 1 } });
+    const branches = await db.mapByIds('restaurant_branches', rows.map((x) => x.branch_id), { projection: { name: 1 } });
     res.json(
-      await db.many(
-        `SELECT rv.*, f.name AS food_name, b.name AS branch_name FROM reviews rv
-           LEFT JOIN food_items f ON f.id = rv.food_item_id JOIN restaurant_branches b ON b.id = rv.branch_id
-          WHERE rv.user_id = $1 ORDER BY rv.created_at DESC`,
-        [req.user.id]
-      )
+      rows
+        .filter((rv) => branches.has(rv.branch_id)) // inner JOIN restaurant_branches
+        .map((rv) => ({ ...rv, food_name: foods.get(rv.food_item_id)?.name ?? null, branch_name: branches.get(rv.branch_id).name ?? null }))
     );
   })
 );
@@ -253,30 +287,40 @@ r.post(
   ah(async (req, res) => {
     const b = req.body;
     if (!req.user.customer_id) throw forbidden('Only customer accounts can post reviews');
-    const branch = await db.one('SELECT restaurant_id FROM restaurant_branches WHERE id = $1', [b.branch_id]);
+    const branch = await db.findOne('restaurant_branches', { id: b.branch_id }, { projection: { restaurant_id: 1 } });
     if (!branch) throw notFound('Restaurant');
     if (b.food_item_id) {
-      const f = await db.one('SELECT id FROM food_items WHERE id = $1 AND restaurant_id = $2', [b.food_item_id, branch.restaurant_id]);
+      const f = await db.exists('food_items', { id: b.food_item_id, restaurant_id: branch.restaurant_id });
       if (!f) throw badRequest('Invalid food item');
     }
     if (b.order_id) {
-      const o = await db.one('SELECT id FROM orders WHERE id = $1 AND customer_id = $2', [b.order_id, req.user.customer_id]);
+      const o = await db.exists('orders', { id: b.order_id, customer_id: req.user.customer_id });
       if (!o) throw badRequest('Invalid order');
-      const dup = await db.one('SELECT id FROM reviews WHERE order_id = $1 AND user_id = $2 AND food_item_id IS NOT DISTINCT FROM $3', [b.order_id, req.user.id, b.food_item_id || null]);
+      // food_item_id IS NOT DISTINCT FROM $3 (null matches null/missing)
+      const dup = await db.exists('reviews', { order_id: b.order_id, user_id: req.user.id, food_item_id: b.food_item_id || null });
       if (dup) throw badRequest('You have already reviewed this');
     }
-    const review = await db.tx(async (t) => {
-      const rv = await t.one(
-        `INSERT INTO reviews(user_id, branch_id, food_item_id, order_id, rating, comment, images) VALUES ($1,$2,$3,$4,$5,$6,$7::text::jsonb) RETURNING *`,
-        [req.user.id, b.branch_id, b.food_item_id || null, b.order_id || null, b.rating, b.comment || null, JSON.stringify(b.images)]
-      );
+    const review = await db.tx(async () => {
+      const rv = await db.insert('reviews', {
+        user_id: req.user.id,
+        branch_id: b.branch_id,
+        food_item_id: b.food_item_id || null,
+        order_id: b.order_id || null,
+        rating: b.rating,
+        comment: b.comment || null,
+        images: b.images,
+      });
       if (b.food_item_id) {
-        await t.query(
-          `UPDATE food_items SET avg_rating = s.avg, rating_count = s.n FROM
-             (SELECT ROUND(AVG(rating)::numeric, 2) AS avg, COUNT(*) AS n FROM reviews WHERE food_item_id = $1 AND is_published) s
-           WHERE id = $1`,
-          [b.food_item_id]
-        );
+        const [s] = await db.aggregate('reviews', [
+          { $match: { food_item_id: b.food_item_id, is_published: true } },
+          { $group: { _id: null, avg: { $avg: '$rating' }, n: { $sum: 1 } } },
+        ]);
+        await db.update('food_items', { id: b.food_item_id }, {
+          $set: {
+            avg_rating: s && s.avg != null ? Math.round((s.avg + Number.EPSILON) * 100) / 100 : null,
+            rating_count: s ? s.n : 0,
+          },
+        });
       }
       return rv;
     });
@@ -288,25 +332,23 @@ r.post(
 r.get(
   '/notifications',
   ah(async (req, res) => {
-    const rows = await db.many(
-      `SELECT id, type, title, message, link, is_read, created_at FROM notifications
-        WHERE user_id = $1 AND channel = 'in_app' ORDER BY created_at DESC LIMIT 50`,
-      [req.user.id]
-    );
+    const rows = (
+      await db.find('notifications', { user_id: req.user.id, channel: 'in_app' }, { sort: { created_at: -1 }, limit: 50 })
+    ).map((n) => pick(n, ['id', 'type', 'title', 'message', 'link', 'is_read', 'created_at']));
     res.json({ items: rows, unread: rows.filter((n) => !n.is_read).length });
   })
 );
 r.post(
   '/notifications/read-all',
   ah(async (req, res) => {
-    await db.query(`UPDATE notifications SET is_read = true WHERE user_id = $1 AND channel = 'in_app'`, [req.user.id]);
+    await db.updateMany('notifications', { user_id: req.user.id, channel: 'in_app' }, { $set: { is_read: true } });
     res.json({ ok: true });
   })
 );
 r.post(
   '/notifications/:id/read',
   ah(async (req, res) => {
-    await db.query('UPDATE notifications SET is_read = true WHERE id = $1 AND user_id = $2', [parseInt(req.params.id, 10) || 0, req.user.id]);
+    await db.update('notifications', { id: parseInt(req.params.id, 10) || 0, user_id: req.user.id }, { $set: { is_read: true } });
     res.json({ ok: true });
   })
 );

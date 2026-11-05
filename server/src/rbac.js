@@ -52,31 +52,42 @@ export const STAFF_ROLES = Object.entries(ROLES)
 
 /** Insert missing roles/permissions. Existing role-permission edits made by admins are preserved. */
 export async function syncRbac(db) {
+  // Upsert permissions (ON CONFLICT (code) DO UPDATE). Ids are allocated only for new codes.
+  const permIds = new Map();
   for (const [code, [module, description]] of Object.entries(PERMISSIONS)) {
-    await db.query(
-      `INSERT INTO permissions(code, module, description) VALUES ($1,$2,$3)
-       ON CONFLICT (code) DO UPDATE SET module = EXCLUDED.module, description = EXCLUDED.description`,
-      [code, module, description]
-    );
+    let p = await db.findOneAndUpdate('permissions', { code }, { $set: { module, description } });
+    if (!p) {
+      const id = await db.nextId('permissions');
+      try {
+        p = await db.findOneAndUpdate('permissions', { code }, { $set: { module, description }, $setOnInsert: { id } }, { upsert: true });
+      } catch (e) {
+        if (e.code !== 11000) throw e; // concurrent startup inserted it first
+        p = await db.findOne('permissions', { code });
+      }
+    }
+    permIds.set(code, p.id);
   }
   // roles.manage is never granted to tenant roles (roles are shared across restaurants).
-  await db.query(
-    `DELETE FROM role_permissions WHERE permission_id = (SELECT id FROM permissions WHERE code = 'roles.manage')
-       AND role_id IN (SELECT id FROM roles WHERE name <> 'super_admin')`
-  );
+  const superAdmin = await db.findOne('roles', { name: 'super_admin' }, { projection: { id: 1 } });
+  await db.remove('role_permissions', {
+    permission_id: permIds.get('roles.manage'),
+    ...(superAdmin ? { role_id: { $ne: superAdmin.id } } : {}),
+  });
   for (const [name, r] of Object.entries(ROLES)) {
-    const existing = await db.one('SELECT id FROM roles WHERE name = $1', [name]);
+    const existing = await db.findOne('roles', { name }, { projection: { id: 1 } });
     if (existing) continue;
-    const role = await db.one(
-      `INSERT INTO roles(name, display_name, is_staff, is_system) VALUES ($1,$2,$3,true) RETURNING id`,
-      [name, r.display, r.staff]
+    const id = await db.nextId('roles');
+    const role = await db.findOneAndUpdate(
+      'roles',
+      { name },
+      { $setOnInsert: { id, name, display_name: r.display, is_staff: r.staff, is_system: true, description: null, created_at: new Date() } },
+      { upsert: true, returnNew: false }
     );
-    if (r.perms.length) {
-      await db.query(
-        `INSERT INTO role_permissions(role_id, permission_id)
-         SELECT $1, id FROM permissions WHERE code = ANY($2::text[])`,
-        [role.id, r.perms]
-      );
+    if (role) continue; // created concurrently by another process
+    for (const code of r.perms) {
+      const permission_id = permIds.get(code);
+      if (permission_id == null) continue;
+      await db.findOneAndUpdate('role_permissions', { role_id: id, permission_id }, { $setOnInsert: { role_id: id, permission_id } }, { upsert: true });
     }
   }
 }

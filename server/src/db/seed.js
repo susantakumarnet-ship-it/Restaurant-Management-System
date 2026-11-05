@@ -79,22 +79,40 @@ const COMMENTS = [
   'Best paneer tikka in town!',
 ];
 
+/** Local 'YYYY-MM-DD' for today + n days (replacement for CURRENT_DATE + n). */
+const dateAdd = (n) => {
+  const d = new Date();
+  d.setDate(d.getDate() + n);
+  return localDate(d);
+};
+/** now() - n days. */
+const daysAgo = (n) => new Date(Date.now() - n * 86400000);
+/** Local wall-clock timestamp minus n days, as an absolute Date. */
+const minusDays = (d, n) => {
+  const x = new Date(d.getTime());
+  x.setDate(x.getDate() - n);
+  return x;
+};
+
 export async function seed({ log = console.log } = {}) {
   const pass = await bcrypt.hash('Admin@123', 10);
   const custPass = await bcrypt.hash('Customer@123', 10);
-  const role = async (name) => (await db.one('SELECT id FROM roles WHERE name = $1', [name])).id;
+  const role = async (name) => (await db.findOne('roles', { name }, { projection: { id: 1 } })).id;
   const R = {};
   for (const n of ['super_admin', 'restaurant_admin', 'manager', 'waiter', 'chef', 'cashier', 'customer']) R[n] = await role(n);
 
   const user = (roleId, name, email, phone, hash, restaurantId = null, branchId = null) =>
-    db.one(
-      `INSERT INTO users(role_id, restaurant_id, branch_id, name, email, phone, password_hash, email_verified, phone_verified)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,true,true) RETURNING id`,
-      [roleId, restaurantId, branchId, name, email, phone, hash]
-    );
+    db.insert('users', {
+      role_id: roleId, restaurant_id: restaurantId, branch_id: branchId, name, email, phone, password_hash: hash, email_verified: true, phone_verified: true,
+    });
 
   await user(R.super_admin, 'Platform Owner', 'super@smartrms.com', '9000000001', pass);
-  await db.query(`INSERT INTO system_settings(key, value) VALUES ('platform_name', '"Smart RMS"'), ('support_email', '"support@smartrms.com"'), ('default_currency', '"INR"'), ('maintenance_mode', 'false')`);
+  await db.insertMany('system_settings', [
+    { key: 'platform_name', value: 'Smart RMS' },
+    { key: 'support_email', value: 'support@smartrms.com' },
+    { key: 'default_currency', value: 'INR' },
+    { key: 'maintenance_mode', value: false },
+  ]);
 
   // ---------- Restaurants ----------
   const restaurants = [
@@ -118,81 +136,84 @@ export async function seed({ log = console.log } = {}) {
   ];
 
   const branchIds = [];
+  const couponsByRestaurant = new Map(); // restaurant_id -> Map(upper(code) -> coupon)
   let firstRestaurantId = null;
   for (const [ri, rs] of restaurants.entries()) {
-    const rest = await db.one(
-      `INSERT INTO restaurants(name, slug, description, cuisine, email, phone, gstin, logo_url, cover_url, subscription_plan, subscription_status, subscription_expires_at, website)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'active', CURRENT_DATE + 300, $11) RETURNING id`,
-      [rs.name, rs.slug, rs.description, rs.cuisine, rs.email, rs.phone, rs.gstin, rs.logo, rs.cover, rs.plan, `https://${rs.slug}.example.com`]
-    );
+    const rest = await db.insert('restaurants', {
+      name: rs.name, slug: rs.slug, description: rs.description, cuisine: rs.cuisine, email: rs.email, phone: rs.phone, gstin: rs.gstin,
+      logo_url: rs.logo, cover_url: rs.cover, subscription_plan: rs.plan, subscription_status: 'active', subscription_expires_at: dateAdd(300),
+      website: `https://${rs.slug}.example.com`,
+    });
     if (ri === 0) firstRestaurantId = rest.id;
     await user(R.restaurant_admin, rs.admin[0], rs.admin[1], rs.admin[2], pass, rest.id);
 
     // menu
     let sort = 0;
     const foodIds = [];
+    const foodImages = [];
     for (const [cat, items] of Object.entries(MENU)) {
       if (ri === 1 && !['Starters', 'Main Course', 'Desserts', 'Beverages'].includes(cat)) continue;
-      const c = await db.one(`INSERT INTO food_categories(restaurant_id, name, sort_order, image_url) VALUES ($1,$2,$3,$4) RETURNING id`, [rest.id, cat, sort++, U(items[0][5], 400)]);
+      const c = await db.insert('food_categories', { restaurant_id: rest.id, name: cat, sort_order: sort++, image_url: U(items[0][5], 400) });
       for (const [name, desc, price, disc, diet, img, o] of items) {
-        const f = await db.one(
-          `INSERT INTO food_items(restaurant_id, category_id, name, description, price, discounted_price, diet_type, prep_time_min, is_bestseller, is_recommended, spice_level, ingredients, allergens)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) RETURNING id, price, discounted_price, name`,
-          [rest.id, c.id, name, desc, price, disc, diet, between(10, 30), !!o.best, !!o.rec, o.spice || 0, desc.split(/,| with | and /).slice(0, 4).join(', '), o.allergens || null]
-        );
-        await db.query('INSERT INTO food_images(food_item_id, url, is_primary) VALUES ($1,$2,true)', [f.id, U(img)]);
+        const f = await db.insert('food_items', {
+          restaurant_id: rest.id, category_id: c.id, name, description: desc, price, discounted_price: disc, diet_type: diet,
+          prep_time_min: between(10, 30), is_bestseller: !!o.best, is_recommended: !!o.rec, spice_level: o.spice || 0,
+          ingredients: desc.split(/,| with | and /).slice(0, 4).join(', '), allergens: o.allergens || null,
+        });
+        foodImages.push({ food_item_id: f.id, url: U(img), is_primary: true });
         foodIds.push(f);
       }
     }
+    await db.insertMany('food_images', foodImages);
 
-    await db.query(
-      `INSERT INTO coupons(restaurant_id, code, title, description, discount_type, discount_value, min_order_amount, max_discount, valid_from, valid_to, per_user_limit, image_url) VALUES
-       ($1,'WELCOME20','20% off your first order','New here? Enjoy 20% off (up to Rs.150).','percent',20,300,150,CURRENT_DATE - 30, CURRENT_DATE + 120, 1, $2),
-       ($1,'FLAT100','Flat Rs.100 off','Flat Rs.100 off on orders above Rs.799.','flat',100,799,NULL,CURRENT_DATE - 10, CURRENT_DATE + 60, NULL, $3),
-       ($1,'WEEKEND15','Weekend feast - 15% off','15% off on all orders, max Rs.250.','percent',15,500,250,CURRENT_DATE - 5, CURRENT_DATE + 90, 3, $4)`,
-      [rest.id, U('photo-1504674900247-0877df9cc836', 600), U('photo-1414235077428-338989a2e8c0', 600), U('photo-1555939594-58d7cb561ad1', 600)]
-    );
+    const coupons = await db.insertMany('coupons', [
+      { restaurant_id: rest.id, code: 'WELCOME20', title: '20% off your first order', description: 'New here? Enjoy 20% off (up to Rs.150).', discount_type: 'percent', discount_value: 20, min_order_amount: 300, max_discount: 150, valid_from: dateAdd(-30), valid_to: dateAdd(120), per_user_limit: 1, image_url: U('photo-1504674900247-0877df9cc836', 600) },
+      { restaurant_id: rest.id, code: 'FLAT100', title: 'Flat Rs.100 off', description: 'Flat Rs.100 off on orders above Rs.799.', discount_type: 'flat', discount_value: 100, min_order_amount: 799, max_discount: null, valid_from: dateAdd(-10), valid_to: dateAdd(60), per_user_limit: null, image_url: U('photo-1414235077428-338989a2e8c0', 600) },
+      { restaurant_id: rest.id, code: 'WEEKEND15', title: 'Weekend feast - 15% off', description: '15% off on all orders, max Rs.250.', discount_type: 'percent', discount_value: 15, min_order_amount: 500, max_discount: 250, valid_from: dateAdd(-5), valid_to: dateAdd(90), per_user_limit: 3, image_url: U('photo-1555939594-58d7cb561ad1', 600) },
+    ]);
+    couponsByRestaurant.set(rest.id, new Map(coupons.map((c) => [c.code.toUpperCase(), c])));
 
-    const supplierIds = [];
-    for (const [n, cp, ph] of [['FreshFarm Produce', 'Mahesh K', '+919845012345'], ['Ocean Catch Seafood', 'Joseph D', '+919822012345'], ['Amul Dairy Distributors', 'Sunita P', '+919900012345'], ['Spice Route Traders', 'Imran S', '+919886012345']]) {
-      supplierIds.push((await db.one(`INSERT INTO suppliers(restaurant_id, name, contact_person, phone, email) VALUES ($1,$2,$3,$4,$5) RETURNING id`, [rest.id, n, cp, ph, `${n.split(' ')[0].toLowerCase()}@supplier.in`])).id);
-    }
+    const supplierIds = (
+      await db.insertMany(
+        'suppliers',
+        [['FreshFarm Produce', 'Mahesh K', '+919845012345'], ['Ocean Catch Seafood', 'Joseph D', '+919822012345'], ['Amul Dairy Distributors', 'Sunita P', '+919900012345'], ['Spice Route Traders', 'Imran S', '+919886012345']].map(([n, cp, ph]) => ({
+          restaurant_id: rest.id, name: n, contact_person: cp, phone: ph, email: `${n.split(' ')[0].toLowerCase()}@supplier.in`,
+        }))
+      )
+    ).map((s) => s.id);
 
     for (const [bi, b] of rs.branches.entries()) {
-      const br = await db.one(
-        `INSERT INTO restaurant_branches(restaurant_id, name, address, city, state, postal_code, latitude, longitude, phone, email, opening_time, closing_time, weekly_holidays, images, map_url)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'11:00','23:00',$11::text::jsonb,$12::text::jsonb,$13) RETURNING id`,
-        [rest.id, b.name, b.address, b.city, b.state, b.postal, b.lat, b.lng, b.phone, rs.email, JSON.stringify(ri === 1 ? [1] : []), JSON.stringify(b.images.map((i) => U(i, 1200))), `https://www.google.com/maps?q=${b.lat != null ? `${b.lat},${b.lng}` : encodeURIComponent(`${b.address}, ${b.city}, ${b.state} ${b.postal}`)}`]
-      );
+      const br = await db.insert('restaurant_branches', {
+        restaurant_id: rest.id, name: b.name, address: b.address, city: b.city, state: b.state, postal_code: b.postal, latitude: b.lat, longitude: b.lng,
+        phone: b.phone, email: rs.email, opening_time: '11:00:00', closing_time: '23:00:00', weekly_holidays: ri === 1 ? [1] : [],
+        images: b.images.map((i) => U(i, 1200)),
+        map_url: `https://www.google.com/maps?q=${b.lat != null ? `${b.lat},${b.lng}` : encodeURIComponent(`${b.address}, ${b.city}, ${b.state} ${b.postal}`)}`,
+      });
       branchIds.push({ id: br.id, restaurantId: rest.id, foods: foodIds, primary: ri === 0 && bi === 0 });
-      await db.query(
-        `INSERT INTO restaurant_settings(branch_id, auto_confirm, advance_payment_required, advance_payment_amount, gst_rate, service_charge_rate, booking_policy)
-         VALUES ($1,$2,false,0,5,$3,$4)`,
-        [br.id, ri === 1, ri === 0 ? 5 : 0,
-          'Tables are held for 15 minutes past the booking time. Free cancellation up to 2 hours before your booking. Large groups (10+) please call ahead. Outside food and beverages are not permitted.']
-      );
+      await db.insert('restaurant_settings', {
+        branch_id: br.id, auto_confirm: ri === 1, advance_payment_required: false, advance_payment_amount: 0, gst_rate: 5, service_charge_rate: ri === 0 ? 5 : 0,
+        booking_policy: 'Tables are held for 15 minutes past the booking time. Free cancellation up to 2 hours before your booking. Large groups (10+) please call ahead. Outside food and beverages are not permitted.',
+      });
 
       // sections & tables
       const sections = {};
       for (const [n, lt, d] of [['Main Hall', 'indoor', 'Air-conditioned main dining room'], ['Garden Patio', 'outdoor', 'Al fresco seating under fairy lights'], ['Rooftop Lounge', 'rooftop', 'City views, open-air'], ['Private Dining', 'private', 'Enclosed room for celebrations & meetings']]) {
         if (ri === 1 && lt === 'rooftop') continue;
-        sections[lt] = (await db.one(`INSERT INTO table_sections(branch_id, name, location_type, description) VALUES ($1,$2,$3,$4) RETURNING id`, [br.id, n, lt, d])).id;
+        sections[lt] = (await db.insert('table_sections', { branch_id: br.id, name: n, location_type: lt, description: d })).id;
       }
       const tableDefs = [
         ['T1', 2, '2_seater', 'indoor'], ['T2', 2, '2_seater', 'indoor'], ['T3', 4, '4_seater', 'indoor'], ['T4', 4, '4_seater', 'indoor'], ['T5', 4, '4_seater', 'indoor'],
         ['T6', 6, '6_seater', 'indoor'], ['P1', 2, '2_seater', 'outdoor'], ['P2', 4, '4_seater', 'outdoor'], ['P3', 6, '6_seater', 'outdoor'],
         ['R1', 2, '2_seater', 'rooftop'], ['R2', 4, '4_seater', 'rooftop'], ['R3', 8, 'family', 'rooftop'], ['V1', 10, 'vip', 'private'], ['V2', 12, 'vip', 'private'],
       ];
-      const tables = [];
-      for (const [num, cap, type, loc] of tableDefs) {
-        if (!sections[loc]) continue;
-        tables.push(
-          await db.one(
-            `INSERT INTO tables(branch_id, section_id, table_number, name, capacity, min_capacity, table_type) VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING id, capacity, table_number`,
-            [br.id, sections[loc], num, `${loc === 'private' ? 'VIP Room' : 'Table'} ${num}`, cap, cap >= 8 ? 4 : 1, type]
-          )
-        );
-      }
+      const tables = await db.insertMany(
+        'tables',
+        tableDefs
+          .filter(([, , , loc]) => sections[loc])
+          .map(([num, cap, type, loc]) => ({
+            branch_id: br.id, section_id: sections[loc], table_number: num, name: `${loc === 'private' ? 'VIP Room' : 'Table'} ${num}`, capacity: cap, min_capacity: cap >= 8 ? 4 : 1, table_type: type,
+          }))
+      );
       branchIds[branchIds.length - 1].tables = tables;
       branchIds[branchIds.length - 1].sections = sections;
 
@@ -204,26 +225,31 @@ export async function seed({ log = console.log } = {}) {
         if (ri === 0 && bi === 0 && ['manager', 'waiter', 'chef', 'cashier'].includes(pos) && !emps.some((e) => e.pos === pos)) {
           uid = (await user(R[pos], n, `${pos}@saffronsage.com`, `90000001${String(i).padStart(2, '0')}`, pass, rest.id, br.id)).id;
         }
-        const e = await db.one(
-          `INSERT INTO employees(branch_id, user_id, name, email, phone, position, salary, hire_date) VALUES ($1,$2,$3,$4,$5,$6,$7, CURRENT_DATE - $8::int) RETURNING id`,
-          [br.id, uid, n, `${n.split(' ')[0].toLowerCase()}.${br.id}@staff.in`, `98${String(br.id).padStart(2, '0')}${String(100000 + i * 1111).slice(0, 6)}`, pos, { manager: 65000, chef: 48000, waiter: 22000, cashier: 25000, host: 21000, delivery: 18000 }[pos], between(60, 900)]
-        );
+        const e = await db.insert('employees', {
+          branch_id: br.id, user_id: uid, name: n, email: `${n.split(' ')[0].toLowerCase()}.${br.id}@staff.in`,
+          phone: `98${String(br.id).padStart(2, '0')}${String(100000 + i * 1111).slice(0, 6)}`, position: pos,
+          salary: { manager: 65000, chef: 48000, waiter: 22000, cashier: 25000, host: 21000, delivery: 18000 }[pos], hire_date: dateAdd(-between(60, 900)),
+        });
         emps.push({ id: e.id, pos });
       }
       branchIds[branchIds.length - 1].chefs = emps.filter((e) => e.pos === 'chef').map((e) => e.id);
+      const shifts = [];
       for (let d = -6; d <= 7; d++) {
         for (const e of emps) {
           const morning = rand() < 0.5;
           const status = d < 0 ? pick(['present', 'present', 'present', 'late', 'absent']) : d === 0 ? 'scheduled' : 'scheduled';
           const date = localDate(addMinutes(new Date(), d * 1440));
-          await db.query(
-            `INSERT INTO staff_shifts(employee_id, shift_date, start_time, end_time, attendance_status, check_in_at, check_out_at)
-             VALUES ($1,$2,$3,$4,$5::varchar, CASE WHEN $5::varchar IN ('present','late') THEN ($2::date + $3::time)::timestamptz + interval '5 minutes' END,
-                     CASE WHEN $5::varchar IN ('present','late') THEN ($2::date + $4::time)::timestamptz END) ON CONFLICT DO NOTHING`,
-            [e.id, date, morning ? '10:30' : '16:00', morning ? '17:00' : '23:30', status]
-          );
+          const start = morning ? '10:30:00' : '16:00:00';
+          const end = morning ? '17:00:00' : '23:30:00';
+          const attended = ['present', 'late'].includes(status);
+          shifts.push({
+            employee_id: e.id, shift_date: date, start_time: start, end_time: end, attendance_status: status,
+            check_in_at: attended ? addMinutes(parseLocal(`${date}T${start}`), 5) : null,
+            check_out_at: attended ? parseLocal(`${date}T${end}`) : null,
+          });
         }
       }
+      await db.insertMany('staff_shifts', shifts);
 
       // inventory
       const inv = [
@@ -232,32 +258,33 @@ export async function seed({ log = console.log } = {}) {
         ['Prawns', 'Seafood', 'kg', 4, 5, 650, 1], ['Butter', 'Dairy', 'kg', 9, 4, 480, 2], ['Garam Masala', 'Spices', 'kg', 3, 1, 900, 3],
         ['Cooking Oil', 'Pantry', 'ltr', 45, 20, 140, 3], ['Mangoes (Alphonso)', 'Fruits', 'kg', 10, 5, 220, 0], ['Coffee Beans', 'Beverages', 'kg', 5, 2, 1100, 3],
       ];
+      const invTx = [];
       for (const [n, cat, unit, qty, min, cost, sup] of inv) {
         const expiry = ['Dairy', 'Meat', 'Seafood', 'Vegetables', 'Fruits'].includes(cat) ? localDate(addMinutes(new Date(), between(1, 12) * 1440)) : null;
-        const item = await db.one(
-          `INSERT INTO inventory_items(branch_id, supplier_id, name, sku, category, unit, quantity, min_quantity, cost_per_unit, expiry_date)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING id`,
-          [br.id, supplierIds[sup], n, `SKU-${br.id}-${n.slice(0, 3).toUpperCase()}`, cat, unit, qty, min, cost, expiry]
-        );
+        const item = await db.insert('inventory_items', {
+          branch_id: br.id, supplier_id: supplierIds[sup], name: n, sku: `SKU-${br.id}-${n.slice(0, 3).toUpperCase()}`, category: cat, unit,
+          quantity: qty, min_quantity: min, cost_per_unit: cost, expiry_date: expiry,
+        });
         let bal = 0;
+        const rows = [];
         for (let k = 0; k < 4; k++) {
           const inQty = Math.round(qty * 0.6);
           bal += inQty;
-          await db.query(
-            `INSERT INTO inventory_transactions(inventory_item_id, type, quantity, unit_cost, total_cost, supplier_id, reference, balance_after, created_at)
-             VALUES ($1,'stock_in',$2,$3,$4,$5,$6,$7, now() - make_interval(days => $8))`,
-            [item.id, inQty, cost, round2(inQty * cost), supplierIds[sup], `PO-${1000 + k}`, bal, 28 - k * 7]
-          );
+          rows.push({
+            inventory_item_id: item.id, type: 'stock_in', quantity: inQty, unit_cost: cost, total_cost: round2(inQty * cost), supplier_id: supplierIds[sup],
+            reference: `PO-${1000 + k}`, balance_after: bal, created_at: daysAgo(28 - k * 7),
+          });
           const out = Math.round(inQty * 0.85);
           bal -= out;
-          await db.query(
-            `INSERT INTO inventory_transactions(inventory_item_id, type, quantity, unit_cost, total_cost, reference, balance_after, created_at)
-             VALUES ($1,'stock_out',$2,$3,$4,'Kitchen usage',$5, now() - make_interval(days => $6))`,
-            [item.id, out, cost, round2(out * cost), bal, 25 - k * 7]
-          );
+          rows.push({
+            inventory_item_id: item.id, type: 'stock_out', quantity: out, unit_cost: cost, total_cost: round2(out * cost), reference: 'Kitchen usage',
+            balance_after: bal, created_at: daysAgo(25 - k * 7),
+          });
         }
-        await db.query(`UPDATE inventory_transactions SET balance_after = $2 WHERE id = (SELECT MAX(id) FROM inventory_transactions WHERE inventory_item_id = $1)`, [item.id, qty]);
+        rows[rows.length - 1].balance_after = qty; // latest movement reflects the current stock level
+        invTx.push(...rows);
       }
+      await db.insertMany('inventory_transactions', invTx);
     }
   }
 
@@ -272,14 +299,20 @@ export async function seed({ log = console.log } = {}) {
     const u = await user(R.customer, name, email, phone, custPass);
     customers.push({ userId: u.id, name, email, phone });
   }
-  for (const c of customers) {
-    c.id = (await db.one(`INSERT INTO customers(user_id, created_at) VALUES ($1, now() - make_interval(days => $2)) RETURNING id`, [c.userId, between(10, 200)])).id;
-  }
+  const custDocs = await db.insertMany('customers', customers.map((c) => ({ user_id: c.userId, created_at: daysAgo(between(10, 200)) })));
+  customers.forEach((c, i) => {
+    c.id = custDocs[i].id;
+    c.spent = 0;
+    c.points = 0;
+  });
 
   // ---------- History: reservations, orders, payments, invoices, reviews ----------
   const SLOTS = ['12:00', '13:30', '19:00', '20:30'];
+  const allReviews = [];
+  const couponUse = new Map(); // coupon id -> count
   for (const b of branchIds) {
     const busyFactor = b.primary ? 1 : 0.45;
+    const resvs = [];
     for (let d = -60; d <= 14; d++) {
       const day = localDate(addMinutes(new Date(), d * 1440));
       const used = new Set();
@@ -296,23 +329,44 @@ export async function seed({ log = console.log } = {}) {
         const past = end.getTime() < Date.now();
         const status = past ? pick(['completed', 'completed', 'completed', 'completed', 'cancelled', 'no_show', 'completed']) : pick(['confirmed', 'confirmed', 'pending', 'confirmed']);
         const guestName = c?.name || `${pick(FIRST)} ${pick(LAST)}`;
-        const r = await db.one(
-          `INSERT INTO reservations(booking_code, branch_id, customer_id, customer_name, phone, email, booking_date, start_at, end_at, guests, status, source, occasion, special_requests, created_at, cancelled_at, cancel_reason)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11::varchar,$12,$13,$14, ($8::timestamp - make_interval(days => $15))::timestamptz,
-                   CASE WHEN $11::varchar = 'cancelled' THEN $8::timestamp - interval '5 hours' END, CASE WHEN $11::varchar = 'cancelled' THEN 'Change of plans' END) RETURNING id`,
-          [
-            `BK-${String(b.id)}${String(d + 100).padStart(3, '0')}${String(k).padStart(2, '0')}`, b.id, c?.id || null, guestName, c?.phone || `97${between(10000000, 99999999)}`, c?.email || null,
-            day, localIso(start), localIso(end), guests, status, c ? 'online' : pick(['phone', 'walk_in']), pick([null, null, 'birthday', 'anniversary', 'family', 'business', 'date']),
-            pick([null, null, null, 'Window seat please', 'High chair for a toddler', 'Celebrating a birthday - cake at 9pm', 'Jain food options']), between(1, 7),
-          ]
-        );
-        await db.query(`INSERT INTO reservation_tables(reservation_id, table_id, start_at, end_at, active) VALUES ($1,$2,$3,$4,$5)`, [r.id, table.id, localIso(start), localIso(end), !['cancelled', 'no_show', 'rejected'].includes(status)]);
-        await db.query(`INSERT INTO reservation_status_history(reservation_id, from_status, to_status, note, created_at) VALUES ($1,NULL,'pending','Booking submitted', now() - interval '10 days')`, [r.id]);
-        if (status !== 'pending') await db.query(`INSERT INTO reservation_status_history(reservation_id, from_status, to_status, created_at) VALUES ($1,'pending',$2, now() - interval '9 days')`, [r.id, status]);
+        // Field order mirrors the old parameter list so the PRNG sequence (and thus the data) is unchanged.
+        const doc = {
+          booking_code: `BK-${String(b.id)}${String(d + 100).padStart(3, '0')}${String(k).padStart(2, '0')}`,
+          branch_id: b.id,
+          customer_id: c?.id || null,
+          customer_name: guestName,
+          phone: c?.phone || `97${between(10000000, 99999999)}`,
+          email: c?.email || null,
+          booking_date: day,
+          start_at: localIso(start),
+          end_at: localIso(end),
+          guests,
+          status,
+          source: c ? 'online' : pick(['phone', 'walk_in']),
+          occasion: pick([null, null, 'birthday', 'anniversary', 'family', 'business', 'date']),
+          special_requests: pick([null, null, null, 'Window seat please', 'High chair for a toddler', 'Celebrating a birthday - cake at 9pm', 'Jain food options']),
+        };
+        doc.created_at = minusDays(start, between(1, 7));
+        doc.cancelled_at = status === 'cancelled' ? addMinutes(start, -300) : null;
+        doc.cancel_reason = status === 'cancelled' ? 'Change of plans' : null;
+        resvs.push({ doc, table, status, start, end });
       }
     }
+    const savedResvs = await db.insertMany('reservations', resvs.map((x) => x.doc));
+    const resTables = [];
+    const history = [];
+    resvs.forEach((x, i) => {
+      const id = savedResvs[i].id;
+      resTables.push({ reservation_id: id, table_id: x.table.id, start_at: localIso(x.start), end_at: localIso(x.end), active: !['cancelled', 'no_show', 'rejected'].includes(x.status) });
+      history.push({ reservation_id: id, from_status: null, to_status: 'pending', note: 'Booking submitted', created_at: daysAgo(10) });
+      if (x.status !== 'pending') history.push({ reservation_id: id, from_status: 'pending', to_status: x.status, created_at: daysAgo(9) });
+    });
+    await db.insertMany('reservation_tables', resTables);
+    await db.insertMany('reservation_status_history', history);
 
     // orders over the last 90 days
+    const coupons = couponsByRestaurant.get(b.restaurantId);
+    const ords = [];
     for (let d = -90; d <= 0; d++) {
       const n = Math.round(between(3, 10) * busyFactor);
       for (let k = 0; k < n; k++) {
@@ -339,55 +393,103 @@ export async function seed({ log = console.log } = {}) {
         const paid = status === 'completed' || (today && rand() < 0.5 && status !== 'pending');
         const method = pick(['cash', 'upi', 'card', 'online', 'online', 'upi']);
         const table = type === 'dine_in' ? pick(b.tables) : null;
-        const o = await db.one(
-          `INSERT INTO orders(order_code, branch_id, customer_id, table_id, order_type, status, payment_status, payment_method, subtotal, discount, coupon_code, tax, service_charge, delivery_charge, total, amount_paid, contact_name, contact_phone, delivery_address, assigned_chef_id, loyalty_awarded, created_at, updated_at)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$22) RETURNING id`,
-          [
-            `OD-${b.id}${String(d + 100).padStart(3, '0')}${String(k).padStart(2, '0')}`, b.id, c?.id || null, table?.id || null, type, status,
-            paid ? 'paid' : status === 'cancelled' ? 'pending' : 'pending', paid ? method : null, subtotal, discount, discount ? 'WEEKEND15' : null, tax, svc, del, total, paid ? total : 0,
-            c?.name || 'Walk-in Guest', c?.phone || null, type === 'delivery' ? `${between(1, 200)}, ${pick(['MG Road', 'Church Street', 'Koramangala 5th Block', 'HSR Layout'])}` : null,
-            ['preparing', 'ready', 'completed'].includes(status) ? pick(b.chefs) : null, status === 'completed' && !!c, created.toISOString(),
-          ]
-        );
-        for (const x of items) {
-          const unit = Number(x.f.discounted_price ?? x.f.price);
-          await db.query(`INSERT INTO order_items(order_id, food_item_id, name, unit_price, quantity, line_total) VALUES ($1,$2,$3,$4,$5,$6)`, [o.id, x.f.id, x.f.name, unit, x.q, round2(unit * x.q)]);
+        const couponCode = discount ? 'WEEKEND15' : null;
+        const coupon = couponCode ? coupons.get(couponCode) : null;
+        if (coupon) couponUse.set(coupon.id, (couponUse.get(coupon.id) || 0) + 1);
+        const doc = {
+          order_code: `OD-${b.id}${String(d + 100).padStart(3, '0')}${String(k).padStart(2, '0')}`,
+          branch_id: b.id,
+          customer_id: c?.id || null,
+          table_id: table?.id || null,
+          order_type: type,
+          status,
+          payment_status: paid ? 'paid' : status === 'cancelled' ? 'pending' : 'pending',
+          payment_method: paid ? method : null,
+          subtotal,
+          discount,
+          coupon_code: couponCode,
+          coupon_id: coupon?.id ?? null,
+          tax,
+          service_charge: svc,
+          delivery_charge: del,
+          total,
+          amount_paid: paid ? total : 0,
+          contact_name: c?.name || 'Walk-in Guest',
+          contact_phone: c?.phone || null,
+          delivery_address: type === 'delivery' ? `${between(1, 200)}, ${pick(['MG Road', 'Church Street', 'Koramangala 5th Block', 'HSR Layout'])}` : null,
+          assigned_chef_id: ['preparing', 'ready', 'completed'].includes(status) ? pick(b.chefs) : null,
+          loyalty_awarded: status === 'completed' && !!c,
+          created_at: created,
+          updated_at: created,
+        };
+        if (paid && c && status === 'completed') {
+          c.spent += total;
+          c.points += Math.floor(total / 100) * 5;
         }
-        if (paid) {
-          await db.query(
-            `INSERT INTO payments(payment_code, branch_id, order_id, user_id, amount, method, status, gateway, gateway_order_id, gateway_payment_id, paid_at, created_at)
-             VALUES ($1,$2,$3,$4,$5,$6,'success',$7,$8,$9,$10,$10)`,
-            [`PAY-${b.id}${String(d + 100).padStart(3, '0')}${String(k).padStart(3, '0')}`, b.id, o.id, c?.userId || null, total, method, method === 'online' ? 'mock' : 'manual', method === 'online' ? `mock_seed_${o.id}` : null, method === 'online' ? `mockpay_seed_${o.id}` : null, created.toISOString()]
-          );
-          await db.query(
-            `INSERT INTO invoices(invoice_number, branch_id, order_id, customer_name, subtotal, discount, cgst, sgst, service_charge, delivery_charge, total, issued_at)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
-            [`INV-${created.getFullYear()}${String(created.getMonth() + 1).padStart(2, '0')}-${String(o.id).padStart(6, '0')}`, b.id, o.id, c?.name || 'Walk-in Guest', subtotal, discount, round2(tax / 2), round2(tax - round2(tax / 2)), svc, del, total, created.toISOString()]
-          );
-          if (c && status === 'completed') await db.query(`UPDATE customers SET total_spent = total_spent + $2, loyalty_points = loyalty_points + $3 WHERE id = $1`, [c.id, total, Math.floor(total / 100) * 5]);
-        }
+        let review = null;
         if (c && status === 'completed' && rand() < 0.12) {
           const f = items[0].f;
-          await db.query(
-            `INSERT INTO reviews(user_id, branch_id, food_item_id, order_id, rating, comment, created_at) VALUES ($1,$2,$3,$4,$5,$6,$7)`,
-            [c.userId, b.id, rand() < 0.5 ? f.id : null, o.id, pick([5, 5, 4, 4, 5, 3]), pick(COMMENTS), created.toISOString()]
-          );
+          review = { user_id: c.userId, branch_id: b.id, food_item_id: rand() < 0.5 ? f.id : null, rating: pick([5, 5, 4, 4, 5, 3]), comment: pick(COMMENTS), created_at: created };
         }
+        ords.push({ doc, items, paid, method, c, created, d, k, review });
       }
     }
+    const savedOrders = await db.insertMany('orders', ords.map((x) => x.doc));
+    const orderItems = [];
+    const payments = [];
+    const invoices = [];
+    const reviews = [];
+    ords.forEach((x, i) => {
+      const o = savedOrders[i];
+      for (const it of x.items) {
+        const unit = Number(it.f.discounted_price ?? it.f.price);
+        orderItems.push({ order_id: o.id, food_item_id: it.f.id, name: it.f.name, unit_price: unit, quantity: it.q, line_total: round2(unit * it.q) });
+      }
+      if (x.paid) {
+        const { method, created, c } = x;
+        payments.push({
+          payment_code: `PAY-${b.id}${String(x.d + 100).padStart(3, '0')}${String(x.k).padStart(3, '0')}`, branch_id: b.id, order_id: o.id, user_id: c?.userId || null,
+          amount: o.total, method, status: 'success', gateway: method === 'online' ? 'mock' : 'manual',
+          gateway_order_id: method === 'online' ? `mock_seed_${o.id}` : null, gateway_payment_id: method === 'online' ? `mockpay_seed_${o.id}` : null,
+          paid_at: created, created_at: created,
+        });
+        invoices.push({
+          invoice_number: `INV-${created.getFullYear()}${String(created.getMonth() + 1).padStart(2, '0')}-${String(o.id).padStart(6, '0')}`,
+          branch_id: b.id, order_id: o.id, customer_name: c?.name || 'Walk-in Guest', subtotal: o.subtotal, discount: o.discount,
+          cgst: round2(o.tax / 2), sgst: round2(o.tax - round2(o.tax / 2)), service_charge: o.service_charge, delivery_charge: o.delivery_charge, total: o.total, issued_at: created,
+        });
+      }
+      if (x.review) reviews.push({ ...x.review, order_id: o.id });
+    });
+    await db.insertMany('order_items', orderItems);
+    await db.insertMany('payments', payments);
+    await db.insertMany('invoices', invoices);
+    const savedReviews = await db.insertMany('reviews', reviews);
+    allReviews.push(...savedReviews);
   }
-  await db.query(
-    `UPDATE food_items f SET avg_rating = s.avg, rating_count = s.n
-       FROM (SELECT food_item_id, ROUND(AVG(rating)::numeric, 2) AS avg, COUNT(*) AS n FROM reviews WHERE food_item_id IS NOT NULL GROUP BY food_item_id) s
-      WHERE f.id = s.food_item_id`
-  );
-  await db.query(
-    `UPDATE orders o SET coupon_id = c.id FROM coupons c, restaurant_branches b
-      WHERE b.id = o.branch_id AND c.restaurant_id = b.restaurant_id AND o.coupon_code = c.code AND o.coupon_id IS NULL`
-  );
-  await db.query(`UPDATE coupons c SET used_count = (SELECT COUNT(*) FROM orders o JOIN restaurant_branches b ON b.id = o.branch_id WHERE o.coupon_code = c.code AND b.restaurant_id = c.restaurant_id)`);
-  await db.query(
-    `INSERT INTO notifications(branch_id, channel, type, title, message, link) SELECT id, 'in_app', 'system', 'Welcome to your dashboard', 'Demo data has been loaded. Explore reservations, orders and reports.', '/admin' FROM restaurant_branches`
+
+  // customer totals (loyalty + spend from completed, paid orders)
+  for (const c of customers) {
+    if (c.spent || c.points) await db.update('customers', { id: c.id }, { $set: { total_spent: round2(c.spent), loyalty_points: c.points } });
+  }
+  // food ratings
+  const ratingStats = new Map();
+  for (const r of allReviews) {
+    if (r.food_item_id == null) continue;
+    const s = ratingStats.get(r.food_item_id) || { sum: 0, n: 0 };
+    s.sum += r.rating;
+    s.n += 1;
+    ratingStats.set(r.food_item_id, s);
+  }
+  for (const [id, s] of ratingStats) await db.update('food_items', { id }, { $set: { avg_rating: round2(s.sum / s.n), rating_count: s.n } });
+  // coupon usage counters
+  for (const [id, n] of couponUse) await db.update('coupons', { id }, { $set: { used_count: n } });
+
+  await db.insertMany(
+    'notifications',
+    branchIds.map((b) => ({
+      branch_id: b.id, channel: 'in_app', type: 'system', title: 'Welcome to your dashboard', message: 'Demo data has been loaded. Explore reservations, orders and reports.', link: '/admin',
+    }))
   );
   log('Demo data loaded.');
   log('  Super admin       super@smartrms.com      / Admin@123');
@@ -399,13 +501,14 @@ export async function seed({ log = console.log } = {}) {
 const isMain = process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);
 if (isMain) {
   await initDb();
-  if (process.argv.includes('--reset')) {
+  const reset = process.argv.includes('--reset');
+  if (reset) {
     console.log('Resetting database...');
-    await db.exec('DROP SCHEMA public CASCADE; CREATE SCHEMA public;');
+    await db.dropAll();
   }
-  await migrate();
-  const { n } = await db.one('SELECT COUNT(*) AS n FROM restaurants');
-  if (n > 0 && !process.argv.includes('--reset')) {
+  await migrate(); // ensureIndexes() + syncRbac()
+  const n = await db.count('restaurants');
+  if (n > 0 && !reset) {
     console.log('Database already has data. Use `npm run db:reset` to wipe and reseed.');
   } else {
     await seed();

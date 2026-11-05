@@ -1,4 +1,4 @@
-﻿# Smart Restaurant Management System
+# Smart Restaurant Management System
 
 A full-stack restaurant platform with two portals:
 
@@ -9,10 +9,10 @@ A full-stack restaurant platform with two portals:
 |---|---|
 | Frontend | React 18, TypeScript, Vite, Tailwind CSS, Recharts, lucide icons. The UI kit is in `client/src/components/ui`. |
 | Backend | Node.js 20+, Express REST API, JWT auth, role-based access control (RBAC), zod validation, helmet, rate limiting |
-| Database | PostgreSQL with SQL migrations, FKs, CHECK constraints and indexes. Dev and test use embedded PostgreSQL (PGlite), so nothing needs installing. |
+| Database | MongoDB (Atlas in production) with unique/partial indexes, multi-document transactions and FK-style cascade rules in the data layer. Dev and test start a local MongoDB automatically, so nothing needs installing. |
 | Integrations | Razorpay (with a built-in mock gateway), SMTP email via nodemailer, Twilio SMS, WhatsApp Cloud API, Google Sign-In, Google Maps embeds |
 | Documents | PDF invoices, booking confirmations and report PDFs (pdfkit); Excel exports (exceljs) |
-| Tests | Vitest + Supertest. 89 backend integration tests on a real Postgres engine, plus frontend unit tests. |
+| Tests | Vitest + Supertest. 89 backend integration tests on a real MongoDB replica set (in-memory), plus frontend unit tests. |
 
 ---
 
@@ -33,7 +33,7 @@ npm install
 npm run dev                 # http://localhost:5173 (proxies /api and /uploads to :4000)
 ```
 
-Without `DATABASE_URL`, the API uses **PGlite**, a full PostgreSQL build that runs in-process and stores data in `server/data/pglite`. Migrations run automatically on start, and an empty database is seeded with demo data.
+Without `MONGODB_URI`, the API starts a **local MongoDB** automatically (via `mongodb-memory-server`; the MongoDB binary is downloaded once on first run) and stores data in `server/data/mongo`. Collections and indexes are created on start, and an empty database is seeded with demo data. Production uses MongoDB Atlas (see §8).
 
 ### Demo accounts
 
@@ -50,10 +50,13 @@ The login page has one-click buttons for these. The demo data contains 2 restaur
 Useful commands (in `server/`):
 
 ```bash
-npm run db:reset   # drop everything, migrate, reseed
-npm run migrate    # apply pending migrations only
+npm run db:reset   # drop everything, recreate indexes, reseed
+npm run migrate    # create collections/indexes and sync roles & permissions
 npm run seed       # seed an empty database
-npm run db:backup  # pg_dump (Postgres) or data-dir tarball (PGlite) into server/backups, keeps 14
+npm run db:backup  # all collections -> server/backups/rms-<time>.json.gz, keeps 14
+npm run db:restore -- backups/<file>.json.gz   # replace the database with a backup
+npm run query                                  # list collections with document counts
+npm run query -- orders "{\"status\":\"pending\"}" 10   # read documents (filter as JSON, limit)
 npm test           # integration test suite
 ```
 
@@ -102,7 +105,7 @@ Code: `server/src/services/booking.js`. Tests: `server/tests/booking.test.js`.
 - **Slots** are generated from branch opening hours, using the configured slot interval and reservation duration. A booking must finish before closing time.
 - **Availability** for a date and party size considers active, non-maintenance tables with `capacity â‰¥ guests`, optionally filtered by section. A table is free for `[start, end)` unless an active booking block overlaps it, including the buffer: `existing.start < new.end + buffer AND existing.end + buffer > new.start`.
 - **Rules:** minimum/maximum guests, maximum advance days, minimum notice, weekly holidays, cancellation deadline for customer changes, only valid status transitions.
-- **Double booking is prevented** inside a database transaction. The transaction locks every candidate `tables` row (`SELECT â€¦ FOR UPDATE`), re-checks overlaps, then inserts. Concurrent requests for the same table queue up: the first commits, and the others see its rows and get `409 TABLE_UNAVAILABLE` / `NO_AVAILABILITY`. A test fires 6 simultaneous requests for one table and asserts exactly one succeeds.
+- **Double booking is prevented** inside a database transaction. The transaction write-locks every candidate `tables` document (`db.lock`), re-checks overlaps, then inserts. Concurrent requests for the same table conflict and retry: the first commits, and the others see its rows and get `409 TABLE_UNAVAILABLE` / `NO_AVAILABILITY`. A test fires 6 simultaneous requests for one table and asserts exactly one succeeds.
 - **Auto-assignment** picks the smallest table that fits. Staff can combine several tables for large parties.
 - **Releasing tables:** rejecting, cancelling or marking a no-show deactivates the booking's table blocks immediately. Completing a booking shortens the block to "now", so the table frees up early.
 - Every change is recorded in `reservation_status_history`.
@@ -136,15 +139,15 @@ Triggers: registration, OTP, booking received/confirmed/rejected/cancelled/modif
 
 ## 6. Database
 
-Schema: `server/src/db/migrations/001_initial_schema.sql`. Migration runner: `npm run migrate`. Each file runs in its own transaction and is tracked in `schema_migrations`.
+Schema: `server/src/db/schema.js` declares every collection with its defaults, foreign-key rules and indexes. Data layer: `server/src/db/index.js`. `npm run migrate` (also run on every start) creates collections and indexes idempotently.
 
-Tables: `users, roles, permissions, role_permissions, restaurants, restaurant_branches, restaurant_settings, system_settings, otp_codes, customers, table_sections, tables, food_categories, food_items, food_images, coupons, reservations, reservation_tables, reservation_status_history, employees, staff_shifts, orders, order_items, payments, invoices, reviews, suppliers, inventory_items, inventory_transactions, notifications, audit_logs`.
+Collections: `users, roles, permissions, role_permissions, restaurants, restaurant_branches, restaurant_settings, system_settings, otp_codes, customers, table_sections, tables, food_categories, food_items, food_images, coupons, reservations, reservation_tables, reservation_status_history, employees, staff_shifts, orders, order_items, payments, invoices, reviews, suppliers, inventory_items, inventory_transactions, notifications, audit_logs`.
 
-- Primary keys, foreign keys (`CASCADE` / `SET NULL` / `RESTRICT` as appropriate), `UNIQUE` constraints (case-insensitive email, phone, booking/order/payment codes, table number per branch, coupon code per restaurant), and `CHECK` constraints (status enums, capacities, prices, discount â‰¤ price, refunded â‰¤ amount, closing > opening).
-- Indexes for the hot paths: the partial overlap index `reservation_tables(table_id, start_at, end_at) WHERE active`, plus branch/date, status, customer, created_at and partial low-stock indexes.
+- Integer `id`s (from a `counters` collection) keep the REST API unchanged; `_id` is never exposed. Foreign-key rules (`cascade` / `set_null` / `restrict`) are enforced by `db.remove()`. Unique indexes cover case-insensitive email, phone, booking/order/payment codes, table number per branch and coupon code per restaurant. Value rules (status enums, capacities, prices, discount <= price, refunded <= amount, closing > opening) are validated in code. Bookings, orders, payments and stock movements use multi-document transactions (`db.tx`).
+- Indexes for the hot paths: `reservation_tables(table_id, start_at, end_at)`, plus branch/date, status, customer and created_at indexes.
 - Roles and permissions are defined in `server/src/rbac.js` and synced on every migrate. Admin edits to role permissions are preserved.
 
-Reservation times are stored as local wall-clock `TIMESTAMP`. Set `TZ` to the restaurant's timezone; the DB session timezone is set to match automatically.
+Reservation times are stored as local wall-clock strings (`YYYY-MM-DDTHH:mm:ss`). Set `TZ` to the restaurant's timezone; reports group dates in the same timezone.
 
 ---
 
@@ -153,7 +156,7 @@ Reservation times are stored as local wall-clock `TIMESTAMP`. Set `TZ` to the re
 - Passwords hashed with bcrypt; OTPs stored hashed, with expiry, attempt limits and resend throttling. Forgot-password gives the same response whether or not the account exists, so it can't be used to discover accounts.
 - JWT bearer authentication. Users and permissions are re-loaded server-side (15 s cache), so deactivating someone or changing a role takes effect quickly.
 - **RBAC:** permission checks on every admin route, plus **tenant isolation**. Staff can only reach branches of their own restaurant (and only their own branch if pinned to one). Foreign keys sent by the client are checked against the same tenant.
-- zod validation on every input; unknown fields are stripped. All SQL is parameterised. Dynamic column names only ever come from schema keys, never user input.
+- zod validation on every input; unknown fields are stripped, so user input never becomes a MongoDB operator. Search text is regex-escaped. Dynamic field names only ever come from schema keys, never user input.
 - React escapes output (XSS); helmet security headers; CORS allow-list.
 - Rate limits: 1000 requests / 15 min per IP overall, and 30 / 15 min on login, register, OTP and password endpoints.
 - Uploads: image MIME types only, magic-byte sniffing, size limit, random file names.
@@ -168,18 +171,18 @@ Reservation times are stored as local wall-clock `TIMESTAMP`. Set `TZ` to the re
 
 ### Docker (recommended)
 ```bash
-cp server/.env.example server/.env   # set JWT_SECRET, Razorpay/SMTP/Twilio keys, TZ, CLIENT_URL
-docker compose up -d --build         # PostgreSQL 16 + app on http://localhost:4000
+cp server/.env.example server/.env   # set MONGODB_URI (Atlas), JWT_SECRET, Razorpay/SMTP/Twilio keys, TZ, CLIENT_URL
+docker compose up -d --build         # app on http://localhost:4000, connected to your Atlas cluster
 docker compose exec app npm run seed # optional demo data
 ```
 The image builds the React app and serves it from the API, so a single container on one port serves everything.
 
 ### Manual
-1. Provision PostgreSQL 14+ and set `DATABASE_URL`, `NODE_ENV=production`, `JWT_SECRET`, `TZ` and `CLIENT_URL`.
+1. Create a MongoDB Atlas cluster (any tier, including the free M0): add a database user, allow your server's IP under *Network Access*, then copy the driver connection string. Set `MONGODB_URI` (and optionally `MONGODB_DB`, default `rms`), `NODE_ENV=production`, `JWT_SECRET`, `TZ` and `CLIENT_URL`. The API refuses to start in production without `MONGODB_URI`.
 2. Build the client: `cd client && npm ci && npm run build`. The API serves `client/dist` automatically. Alternatively, host `dist/` on a CDN and set `VITE_API_URL` before building.
 3. Start the API: `cd server && npm ci --omit=dev && npm run migrate && npm start`. Run it under a process manager such as pm2 or systemd, behind an HTTPS reverse proxy.
 4. Razorpay dashboard: add the webhook `https://<host>/api/payments/webhook` (event `payment.captured`) and set `RAZORPAY_WEBHOOK_SECRET`.
-5. Schedule `npm run db:backup` (cron), or use your managed database's backups and point-in-time recovery.
+5. Schedule `npm run db:backup` (cron), or use Atlas cloud backups / point-in-time recovery.
 6. **Cloud storage:** uploads are stored on local disk (`UPLOAD_DIR`, served at `/uploads`). For S3, GCS or Cloudinary, replace `store()` in `server/src/routes/uploads.js`. It is the only function that writes files; everything else just stores the returned URL.
 
 ---
@@ -187,7 +190,7 @@ The image builds the React app and serves it from the API, so a single container
 ## 9. Tests
 
 ```bash
-cd server && npm test   # 89 integration tests, fresh in-memory PostgreSQL per file
+cd server && npm test   # 89 integration tests, fresh in-memory MongoDB replica set per file
 cd client && npm test   # unit tests (formatting, form/payload mapping)
 cd client && npm run build   # type-check + production build
 ```
@@ -207,12 +210,12 @@ Backend coverage:
 server/
   src/
     app.js, index.js, config.js, rbac.js
-    db/        index.js (pg / PGlite adapter), migrate.js, seed.js, migrations/*.sql
+    db/        index.js (MongoDB data layer), schema.js (collections, defaults, FK rules, indexes), migrate.js, seed.js
     middleware/ auth.js (JWT, RBAC, branch scope), audit.js
     services/  booking.js, orders.js, payments.js, notify.js, reports.js, pdf.js, scheduler.js
     routes/    auth.js, public.js, customer.js, uploads.js, superadmin.js, admin/*.js
   tests/       *.test.js (Vitest + Supertest)
-  scripts/     backup.js, smoke.js
+  scripts/     backup.js (backup/restore), query.js, smoke.js
 client/
   src/
     lib/        api.ts, format.ts, types.ts
@@ -225,7 +228,7 @@ docs/API.md     REST API reference
 
 ## 11. Known limitations
 
-- On PGlite (single connection), concurrent booking requests are serialised by the engine itself. On PostgreSQL, the row locks described above do the work. Both paths run the same code.
+- MongoDB transactions need a replica set: Atlas always provides one, and the local dev/test database runs as a single-node replica set. A standalone self-hosted `mongod` will not work.
 - Uploaded files go to local disk until a cloud storage adapter is plugged in (see Â§8.6).
 - Restaurants that close after midnight (closing time earlier than opening time) are not supported by the slot generator.
 - System settings keys can be added and edited from the super admin UI but not deleted (there is no delete endpoint).

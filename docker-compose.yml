@@ -1,36 +1,18 @@
 services:
-  db:
-    image: postgres:16-alpine
-    restart: unless-stopped
-    environment:
-      POSTGRES_DB: rms
-      POSTGRES_USER: rms
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-rms_password}
-    volumes:
-      - pgdata:/var/lib/postgresql/data
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U rms -d rms"]
-      interval: 5s
-      retries: 10
-
   app:
     build: .
     restart: unless-stopped
-    depends_on:
-      db:
-        condition: service_healthy
     ports:
       - "4000:4000"
+    # server/.env must contain MONGODB_URI (your MongoDB Atlas connection string) and JWT_SECRET.
     env_file:
       - ./server/.env
     environment:
       NODE_ENV: production
-      DATABASE_URL: postgres://rms:${POSTGRES_PASSWORD:-rms_password}@db:5432/rms
       CLIENT_URL: ${CLIENT_URL:-http://localhost:4000}
       EXPOSE_OTP: "false"
     volumes:
       - uploads:/app/server/uploads
 
 volumes:
-  pgdata:
   uploads:

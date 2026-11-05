@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
-import { client, db, login, setupApp, teardown } from './helpers.js';
+import { client, customerByEmail, db, login, setupApp, teardown } from './helpers.js';
 
 let app, fx, cust, admin;
 beforeAll(async () => {
@@ -35,10 +35,10 @@ describe('Pricing', () => {
   it('rejects invalid coupons and unavailable items', async () => {
     expect((await cust.post('/api/public/coupons/validate', { branch_id: fx.A.branchId, code: 'NOPE', subtotal: 500 })).status).toBe(400);
     expect((await cust.post('/api/public/coupons/validate', { branch_id: fx.A.branchId, code: 'SAVE10', subtotal: 50 })).status).toBe(400);
-    await db.query('UPDATE food_items SET is_available = false WHERE id = $1', [fx.food.naan]);
+    await db.update('food_items', { id: fx.food.naan }, { is_available: false });
     const res = await cust.post('/api/customer/orders', order());
     expect(res.status).toBe(400);
-    await db.query('UPDATE food_items SET is_available = true WHERE id = $1', [fx.food.naan]);
+    await db.update('food_items', { id: fx.food.naan }, { is_available: true });
   });
 });
 
@@ -86,7 +86,7 @@ describe('Order + online payment + invoice', () => {
     expect((await admin.patch(`/api/admin/orders/${orderId}/status`, { status: 'ready' })).status).toBe(200);
     expect((await admin.patch(`/api/admin/orders/${orderId}/status`, { status: 'served' })).status).toBe(400); // takeaway can't be served
     expect((await admin.patch(`/api/admin/orders/${orderId}/status`, { status: 'completed' })).status).toBe(200);
-    const c = await db.one(`SELECT c.loyalty_points, c.total_spent FROM customers c JOIN users u ON u.id = c.user_id WHERE u.email = 'cust@test.com'`);
+    const c = await customerByEmail('cust@test.com');
     expect(c.loyalty_points).toBe(20); // floor(453.6/100)=4 * 5
     expect(c.total_spent).toBe(453.6);
   });
@@ -108,7 +108,7 @@ describe('POS orders, partial payments and cancellations', () => {
     expect(created.body.status).toBe('confirmed');
     const total = created.body.total; // 200 + 5% = 210
     expect(total).toBe(210);
-    const tbl = await db.one('SELECT status FROM tables WHERE id = $1', [fx.tables.t4]);
+    const tbl = await db.byId('tables', fx.tables.t4);
     expect(tbl.status).toBe('occupied');
 
     const p1 = await admin.post('/api/admin/payments', { order_id: created.body.id, amount: 100, method: 'cash' });
@@ -148,7 +148,7 @@ describe('Reviews', () => {
   it('lets a customer rate a dish and updates the average', async () => {
     const res = await cust.post('/api/customer/reviews', { branch_id: fx.A.branchId, food_item_id: fx.food.curry, rating: 4, comment: 'Tasty' });
     expect(res.status).toBe(201);
-    const f = await db.one('SELECT avg_rating, rating_count FROM food_items WHERE id = $1', [fx.food.curry]);
+    const f = await db.byId('food_items', fx.food.curry);
     expect(f.avg_rating).toBe(4);
     expect(f.rating_count).toBe(1);
     const pub = await cust.get(`/api/public/branches/${fx.A.branchId}/reviews`);

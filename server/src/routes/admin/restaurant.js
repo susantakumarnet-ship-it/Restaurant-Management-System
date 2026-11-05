@@ -3,7 +3,7 @@ import { z } from 'zod';
 import { db } from '../../db/index.js';
 import { ah, badRequest, forbidden, notFound, validate } from '../../utils/http.js';
 import { requirePerm } from '../../middleware/auth.js';
-import { buildUpdate } from '../../utils/common.js';
+import { definedOnly, invalid, toTime } from '../../utils/common.js';
 import { zs } from './crud.js';
 
 const r = Router();
@@ -22,7 +22,7 @@ const restaurantSchema = z.object({
 
 r.get(
   '/restaurant',
-  ah(async (req, res) => res.json(await db.one('SELECT * FROM restaurants WHERE id = $1', [req.restaurantId])))
+  ah(async (req, res) => res.json(await db.byId('restaurants', req.restaurantId)))
 );
 
 r.put(
@@ -30,9 +30,9 @@ r.put(
   requirePerm('restaurant.manage'),
   validate(restaurantSchema.partial()),
   ah(async (req, res) => {
-    const { sets, values } = buildUpdate(req.body, { startIndex: 2 });
-    if (sets.length) await db.query(`UPDATE restaurants SET ${sets.join(', ')}, updated_at = now() WHERE id = $1`, [req.restaurantId, ...values]);
-    res.json(await db.one('SELECT * FROM restaurants WHERE id = $1', [req.restaurantId]));
+    const data = definedOnly(req.body);
+    if (Object.keys(data).length) await db.update('restaurants', { id: req.restaurantId }, { $set: { ...data, updated_at: new Date() } });
+    res.json(await db.byId('restaurants', req.restaurantId));
   })
 );
 
@@ -54,10 +54,15 @@ export const branchSchema = z.object({
   is_active: z.boolean().optional(),
 });
 
+/** Was CHECK (closing_time > opening_time) on restaurant_branches. */
+function checkHours(opening, closing) {
+  if (opening != null && closing != null && !(closing > opening)) throw invalid('Closing time must be after opening time');
+}
+
 // Branch list for the current restaurant (all staff can read; managing requires restaurant.manage)
 r.get(
   '/branches',
-  ah(async (req, res) => res.json(await db.many('SELECT * FROM restaurant_branches WHERE restaurant_id = $1 ORDER BY id', [req.restaurantId])))
+  ah(async (req, res) => res.json(await db.find('restaurant_branches', { restaurant_id: req.restaurantId }, { sort: { id: 1 } })))
 );
 
 r.post(
@@ -67,15 +72,29 @@ r.post(
   ah(async (req, res) => {
     if (req.user.branch_id) throw forbidden('Branch-level staff cannot create branches');
     const b = req.body;
-    const row = await db.tx(async (t) => {
-      const br = await t.one(
-        `INSERT INTO restaurant_branches(restaurant_id, name, address, city, state, postal_code, latitude, longitude, map_url, phone, email,
-            opening_time, closing_time, weekly_holidays, images, is_active)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14::text::jsonb,$15::text::jsonb, COALESCE($16, true)) RETURNING *`,
-        [req.restaurantId, b.name, b.address, b.city, b.state, b.postal_code, b.latitude, b.longitude, b.map_url, b.phone, b.email,
-          b.opening_time, b.closing_time, JSON.stringify(b.weekly_holidays), JSON.stringify(b.images), b.is_active ?? null]
-      );
-      await t.query('INSERT INTO restaurant_settings(branch_id) VALUES ($1)', [br.id]);
+    const opening_time = toTime(b.opening_time);
+    const closing_time = toTime(b.closing_time);
+    checkHours(opening_time, closing_time);
+    const row = await db.tx(async () => {
+      const br = await db.insert('restaurant_branches', {
+        restaurant_id: req.restaurantId,
+        name: b.name,
+        address: b.address ?? null,
+        city: b.city ?? null,
+        state: b.state ?? null,
+        postal_code: b.postal_code ?? null,
+        latitude: b.latitude ?? null,
+        longitude: b.longitude ?? null,
+        map_url: b.map_url ?? null,
+        phone: b.phone ?? null,
+        email: b.email ?? null,
+        opening_time,
+        closing_time,
+        weekly_holidays: b.weekly_holidays,
+        images: b.images,
+        is_active: b.is_active ?? true,
+      });
+      await db.insert('restaurant_settings', { branch_id: br.id });
       return br;
     });
     res.locals.createdId = row.id;
@@ -89,12 +108,17 @@ r.put(
   validate(branchSchema.partial()),
   ah(async (req, res) => {
     const id = parseInt(req.params.id, 10);
-    const br = await db.one('SELECT id FROM restaurant_branches WHERE id = $1 AND restaurant_id = $2', [id, req.restaurantId]);
+    const br = await db.findOne('restaurant_branches', { id, restaurant_id: req.restaurantId });
     if (!br) throw notFound('Branch');
     if (req.user.branch_id && req.user.branch_id !== id) throw forbidden();
-    const { sets, values } = buildUpdate(req.body, { json: ['weekly_holidays', 'images'], startIndex: 2 });
-    if (sets.length) await db.query(`UPDATE restaurant_branches SET ${sets.join(', ')}, updated_at = now() WHERE id = $1`, [id, ...values]);
-    res.json(await db.one('SELECT * FROM restaurant_branches WHERE id = $1', [id]));
+    const data = definedOnly(req.body);
+    if (data.opening_time != null) data.opening_time = toTime(data.opening_time);
+    if (data.closing_time != null) data.closing_time = toTime(data.closing_time);
+    if (Object.keys(data).length) {
+      checkHours(data.opening_time ?? br.opening_time, data.closing_time ?? br.closing_time);
+      await db.update('restaurant_branches', { id }, { $set: { ...data, updated_at: new Date() } });
+    }
+    res.json(await db.byId('restaurant_branches', id));
   })
 );
 
@@ -104,14 +128,14 @@ r.delete(
   ah(async (req, res) => {
     const id = parseInt(req.params.id, 10);
     if (req.user.branch_id) throw forbidden();
-    const count = await db.one('SELECT COUNT(*) AS n FROM restaurant_branches WHERE restaurant_id = $1', [req.restaurantId]);
-    if (count.n <= 1) throw badRequest('A restaurant must have at least one branch');
-    const used = await db.one('SELECT (SELECT COUNT(*) FROM reservations WHERE branch_id = $1) + (SELECT COUNT(*) FROM orders WHERE branch_id = $1) AS n', [id]);
-    if (used.n > 0) {
-      await db.query('UPDATE restaurant_branches SET is_active = false WHERE id = $1 AND restaurant_id = $2', [id, req.restaurantId]);
+    const count = await db.count('restaurant_branches', { restaurant_id: req.restaurantId });
+    if (count <= 1) throw badRequest('A restaurant must have at least one branch');
+    const used = (await db.count('reservations', { branch_id: id })) + (await db.count('orders', { branch_id: id }));
+    if (used > 0) {
+      await db.update('restaurant_branches', { id, restaurant_id: req.restaurantId }, { $set: { is_active: false } });
       return res.json({ ok: true, deactivated: true, message: 'Branch has history, so it was deactivated instead of deleted.' });
     }
-    await db.query('DELETE FROM restaurant_branches WHERE id = $1 AND restaurant_id = $2', [id, req.restaurantId]);
+    await db.remove('restaurant_branches', { id, restaurant_id: req.restaurantId });
     res.json({ ok: true });
   })
 );
@@ -138,19 +162,19 @@ const settingsSchema = z.object({
   booking_policy: zs.optStr(5000),
 });
 
-r.get('/settings', ah(async (req, res) => res.json(await db.one('SELECT * FROM restaurant_settings WHERE branch_id = $1', [req.branchId]))));
+r.get('/settings', ah(async (req, res) => res.json(await db.findOne('restaurant_settings', { branch_id: req.branchId }))));
 
 r.put(
   '/settings',
   requirePerm('restaurant.manage'),
   validate(settingsSchema.partial()),
   ah(async (req, res) => {
-    const cur = await db.one('SELECT * FROM restaurant_settings WHERE branch_id = $1', [req.branchId]);
+    const cur = await db.findOne('restaurant_settings', { branch_id: req.branchId });
     const merged = { ...cur, ...req.body };
     if (merged.max_guests < merged.min_guests) throw badRequest('Maximum guests must be greater than or equal to minimum guests');
-    const { sets, values } = buildUpdate(req.body, { startIndex: 2 });
-    if (sets.length) await db.query(`UPDATE restaurant_settings SET ${sets.join(', ')}, updated_at = now() WHERE branch_id = $1`, [req.branchId, ...values]);
-    res.json(await db.one('SELECT * FROM restaurant_settings WHERE branch_id = $1', [req.branchId]));
+    const data = definedOnly(req.body);
+    if (Object.keys(data).length) await db.update('restaurant_settings', { branch_id: req.branchId }, { $set: { ...data, updated_at: new Date() } });
+    res.json(await db.findOne('restaurant_settings', { branch_id: req.branchId }));
   })
 );
 

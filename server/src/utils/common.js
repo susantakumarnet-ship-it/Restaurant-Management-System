@@ -34,20 +34,32 @@ export const toMinutes = (hhmm) => {
 };
 export const fromMinutes = (mins) => `${pad(Math.floor(mins / 60))}:${pad(mins % 60)}`;
 
-/** Build a dynamic UPDATE SET clause from a whitelisted, already-validated object. */
-export function buildUpdate(data, { json = [], startIndex = 1 } = {}) {
-  const keys = Object.keys(data).filter((k) => data[k] !== undefined);
-  const sets = keys.map((k, i) => `${k} = $${i + startIndex}${json.includes(k) ? '::text::jsonb' : ''}`);
-  const values = keys.map((k) => (json.includes(k) ? JSON.stringify(data[k]) : data[k]));
-  return { sets, values, keys };
+/** Copy of an already-validated object without undefined values (safe for $set / insert). */
+export function definedOnly(data) {
+  const out = {};
+  for (const [k, v] of Object.entries(data)) if (v !== undefined) out[k] = v;
+  return out;
 }
 
-export function buildInsert(data, { json = [] } = {}) {
-  const keys = Object.keys(data).filter((k) => data[k] !== undefined);
-  const placeholders = keys.map((k, i) => `$${i + 1}${json.includes(k) ? '::text::jsonb' : ''}`);
-  const values = keys.map((k) => (json.includes(k) ? JSON.stringify(data[k]) : data[k]));
-  return { cols: keys.join(', '), placeholders: placeholders.join(', '), values };
+/** Normalise a TIME value to 'HH:mm:ss' (what PostgreSQL used to return). */
+export const toTime = (v) => {
+  if (v == null || v === '') return v;
+  const [h = '0', m = '0', s = '0'] = String(v).split(':');
+  return `${pad(Number(h))}:${pad(Number(m))}:${pad(Number(s))}`;
+};
+
+/** Normalise a local TIMESTAMP value to 'YYYY-MM-DDTHH:mm:ss'. Accepts Date or string. */
+export const toLocalTs = (v) => (v == null ? v : v instanceof Date ? localIso(v) : localIso(parseLocal(v)));
+
+/** Throw a 422 INVALID_VALUE (replacement for PostgreSQL CHECK constraint violations). */
+export function invalid(message = 'One or more values are invalid.') {
+  const e = new Error(message);
+  e.code = 'INVALID_VALUE';
+  return e;
 }
+
+/** Case-insensitive "contains" filter value for user search input (replacement for ILIKE '%q%'). */
+export const ilike = (q) => ({ $regex: String(q).trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), $options: 'i' });
 
 export const slugify = (s) =>
   String(s)

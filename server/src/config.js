@@ -15,9 +15,11 @@ export const config = {
   clientUrl: env.CLIENT_URL || 'http://localhost:5173',
   publicUrl: env.PUBLIC_URL || `http://localhost:${env.PORT || 4000}`,
 
-  // Database: DATABASE_URL -> real PostgreSQL; otherwise embedded PGlite (Postgres in WASM)
-  databaseUrl: isTest ? '' : env.DATABASE_URL || '',
-  pgliteDir: isTest ? '' : env.PGLITE_DIR ?? path.join(root, 'data', 'pglite'),
+  // Database: MONGODB_URI -> that MongoDB server (Atlas in production);
+  // otherwise (dev only) a local MongoDB started by mongodb-memory-server, persisted in MONGO_DATA_DIR.
+  mongoUri: isTest ? '' : env.MONGODB_URI || '',
+  mongoDbName: env.MONGODB_DB || 'rms',
+  mongoDataDir: isTest ? '' : env.MONGO_DATA_DIR ?? path.join(root, 'data', 'mongo'),
 
   jwtSecret: env.JWT_SECRET || 'dev-insecure-secret-change-me',
   jwtExpiresIn: env.JWT_EXPIRES_IN || '1d',

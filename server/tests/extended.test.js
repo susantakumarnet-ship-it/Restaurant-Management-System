@@ -1,6 +1,6 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import request from 'supertest';
-import { client, daysFromNow, db, login, setupApp, teardown, tomorrow } from './helpers.js';
+import { client, customerByEmail, daysFromNow, db, login, setupApp, teardown, tomorrow } from './helpers.js';
 
 let app, fx, admin, cust, cust2, sup;
 beforeAll(async () => {
@@ -30,7 +30,7 @@ describe('HTTP basics', () => {
   });
   it('health check reports the database', async () => {
     const res = await request(app).get('/api/health');
-    expect(res.body).toMatchObject({ status: 'ok', db: 'pglite' });
+    expect(res.body).toMatchObject({ status: 'ok', db: 'mongodb-memory' });
   });
 });
 
@@ -57,7 +57,7 @@ describe('Access control regressions', () => {
     expect((await c2.get('/api/customer/bookings')).status).toBe(200);
     // customer must have activity in the restaurant to be visible to its admin
     await book(c2, { phone: '9876500002', date: daysFromNow(9) });
-    const custRow = await db.one(`SELECT c.id FROM customers c JOIN users u ON u.id = c.user_id WHERE u.email = 'cust2@test.com'`);
+    const custRow = await customerByEmail('cust2@test.com');
     expect((await admin.patch(`/api/admin/customers/${custRow.id}`, { status: 'blocked' })).status).toBe(200);
     const blocked = await c2.get('/api/customer/bookings');
     expect(blocked.status).toBe(403);
@@ -81,14 +81,14 @@ describe('Access control regressions', () => {
   });
 
   it('a deactivated restaurant stops accepting bookings and orders', async () => {
-    await db.query('UPDATE restaurants SET is_active = false WHERE id = $1', [fx.A.restaurantId]);
+    await db.update('restaurants', { id: fx.A.restaurantId }, { is_active: false });
     const b = await book(cust, { date: daysFromNow(8) });
     expect(b.status).toBe(400);
     const o = await cust.post('/api/customer/orders', { branch_id: fx.A.branchId, order_type: 'takeaway', items: [{ food_item_id: fx.food.curry, quantity: 1 }], contact_name: 'Cust', contact_phone: '9876500001' });
     expect(o.status).toBe(400);
     const pub = await request(app).get('/api/public/branches');
     expect(pub.body.find((x) => x.id === fx.A.branchId)).toBeUndefined();
-    await db.query('UPDATE restaurants SET is_active = true WHERE id = $1', [fx.A.restaurantId]);
+    await db.update('restaurants', { id: fx.A.restaurantId }, { is_active: true });
   });
 });
 
@@ -134,9 +134,9 @@ describe('Reservation operations (admin)', () => {
     expect(r.status).toBe(201);
     id = r.body.id;
     await admin.patch(`/api/admin/reservations/${id}/status`, { status: 'seated' });
-    expect((await db.one('SELECT status FROM tables WHERE id = $1', [fx.tables.t2])).status).toBe('occupied');
+    expect((await db.byId('tables', fx.tables.t2)).status).toBe('occupied');
     await admin.patch(`/api/admin/reservations/${id}/status`, { status: 'completed' });
-    expect((await db.one('SELECT status FROM tables WHERE id = $1', [fx.tables.t2])).status).toBe('available');
+    expect((await db.byId('tables', fx.tables.t2)).status).toBe('available');
   });
 
   it('no-show releases the table for re-booking', async () => {
@@ -170,13 +170,13 @@ describe('Reservation operations (admin)', () => {
 
   it('cannot book a closed weekday', async () => {
     const day = [...Array(8)].map((_, i) => daysFromNow(i + 1)).find((d) => new Date(d + 'T00:00').getDay() === 2);
-    await db.query(`UPDATE restaurant_branches SET weekly_holidays = '[2]' WHERE id = $1`, [fx.A.branchId]);
+    await db.update('restaurant_branches', { id: fx.A.branchId }, { weekly_holidays: [2] });
     const res = await book(cust, { date: day });
     expect(res.status).toBe(400);
     expect(res.body.error.message).toMatch(/closed/);
     const av = await request(app).get(`/api/public/branches/${fx.A.branchId}/availability?date=${day}&guests=2`);
     expect(av.body.closed).toBe(true);
-    await db.query(`UPDATE restaurant_branches SET weekly_holidays = '[]' WHERE id = $1`, [fx.A.branchId]);
+    await db.update('restaurant_branches', { id: fx.A.branchId }, { weekly_holidays: [] });
   });
 });
 
@@ -254,10 +254,10 @@ describe('Reviews moderation', () => {
   it('hiding a review removes it publicly and recalculates the dish rating', async () => {
     const r1 = await cust.post('/api/customer/reviews', { branch_id: fx.A.branchId, food_item_id: fx.food.naan, rating: 2, comment: 'Meh' });
     await cust2.post('/api/customer/reviews', { branch_id: fx.A.branchId, food_item_id: fx.food.naan, rating: 4, comment: 'Good' });
-    expect((await db.one('SELECT avg_rating FROM food_items WHERE id = $1', [fx.food.naan])).avg_rating).toBe(3);
+    expect((await db.byId('food_items', fx.food.naan)).avg_rating).toBe(3);
     const hide = await admin.patch(`/api/admin/reviews/${r1.body.id}`, { is_published: false, admin_reply: 'Sorry about that!' });
     expect(hide.status).toBe(200);
-    expect((await db.one('SELECT avg_rating, rating_count FROM food_items WHERE id = $1', [fx.food.naan]))).toEqual({ avg_rating: 4, rating_count: 1 });
+    expect(await db.byId('food_items', fx.food.naan, { projection: { avg_rating: 1, rating_count: 1 } })).toEqual({ avg_rating: 4, rating_count: 1 });
     const pub = await request(app).get(`/api/public/branches/${fx.A.branchId}/reviews`);
     expect(pub.body.find((x) => x.id === r1.body.id)).toBeUndefined();
   });
@@ -267,7 +267,7 @@ describe('Branches & settings', () => {
   it('creating a branch also creates its settings; last branch cannot be deleted', async () => {
     const br = await admin.post('/api/admin/branches', { name: 'Second', opening_time: '10:00', closing_time: '22:00', weekly_holidays: [1] });
     expect(br.status).toBe(201);
-    const s = await db.one('SELECT * FROM restaurant_settings WHERE branch_id = $1', [br.body.id]);
+    const s = await db.findOne('restaurant_settings', { branch_id: br.body.id });
     expect(s.reservation_duration_min).toBe(90);
     expect((await admin.delete(`/api/admin/branches/${br.body.id}`)).status).toBe(200);
     expect((await admin.delete(`/api/admin/branches/${fx.A.branchId}`)).status).toBe(400);
@@ -282,7 +282,7 @@ describe('Super admin', () => {
   it('creates a restaurant with a branch and an admin who is isolated to it', async () => {
     const r = await sup.post('/api/super/restaurants', { name: 'Brand New Diner', branch_name: 'Downtown', city: 'Pune', subscription_plan: 'pro' });
     expect(r.status).toBe(201);
-    const branch = await db.one('SELECT id FROM restaurant_branches WHERE restaurant_id = $1', [r.body.id]);
+    const branch = await db.findOne('restaurant_branches', { restaurant_id: r.body.id });
     const a = await sup.post('/api/super/admins', { name: 'New Admin', email: 'newadmin@test.com', password: 'Admin12345', role: 'restaurant_admin', restaurant_id: r.body.id });
     expect(a.status).toBe(201);
     const token = await login(app, 'newadmin@test.com', 'Admin12345');
@@ -293,7 +293,7 @@ describe('Super admin', () => {
   });
   it('validates admin tenancy and prevents self-demotion', async () => {
     expect((await sup.post('/api/super/admins', { name: 'Xavier', email: 'x@test.com', password: 'Admin12345', role: 'manager' })).status).toBe(400);
-    const me = await db.one(`SELECT id FROM users WHERE email = 'super@test.com'`);
+    const me = await db.findOne('users', { email: 'super@test.com' });
     expect((await sup.put(`/api/super/admins/${me.id}`, { is_active: false })).status).toBe(400);
   });
   it('saves system settings and runs consolidated reports', async () => {

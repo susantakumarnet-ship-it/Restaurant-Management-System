@@ -42,18 +42,18 @@ export function errorHandler(err, req, res, _next) {
   if (err?.code === 'LIMIT_FILE_SIZE') {
     return res.status(413).json({ error: { code: 'FILE_TOO_LARGE', message: 'File too large' } });
   }
-  // PostgreSQL constraint errors -> friendly 4xx
-  if (err?.code === '23505') return res.status(409).json({ error: { code: 'DUPLICATE', message: duplicateMessage(err) } });
-  if (err?.code === '23503') return res.status(409).json({ error: { code: 'IN_USE', message: 'This record is referenced by other data and cannot be removed or linked.' } });
-  if (err?.code === '23514' || err?.code === '22P02' || err?.code === '22007' || err?.code === '22008') {
-    return res.status(422).json({ error: { code: 'INVALID_VALUE', message: 'One or more values are invalid.' } });
+  // MongoDB / data-layer errors -> friendly 4xx
+  if (err?.code === 11000) return res.status(409).json({ error: { code: 'DUPLICATE', message: duplicateMessage(err) } });
+  if (err?.code === 'IN_USE') return res.status(409).json({ error: { code: 'IN_USE', message: 'This record is referenced by other data and cannot be removed or linked.' } });
+  if (err?.code === 'INVALID_VALUE' || err?.code === 121) {
+    return res.status(422).json({ error: { code: 'INVALID_VALUE', message: err.message && err.code === 'INVALID_VALUE' ? err.message : 'One or more values are invalid.' } });
   }
   console.error('[error]', req.method, req.originalUrl, err?.message || err);
   res.status(500).json({ error: { code: 'INTERNAL', message: 'Something went wrong. Please try again.' } });
 }
 
 function duplicateMessage(err) {
-  const c = `${err.constraint || ''} ${err.detail || ''}`;
+  const c = `${Object.keys(err.keyPattern || {}).join(' ')} ${err.message || ''}`;
   if (c.includes('email')) return 'An account with this email already exists.';
   if (c.includes('phone')) return 'An account with this mobile number already exists.';
   if (c.includes('code')) return 'This code is already in use.';

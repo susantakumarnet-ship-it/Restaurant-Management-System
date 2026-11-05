@@ -25,7 +25,8 @@ describe('Registration, OTP & login', () => {
     expect(blocked.status).toBe(403);
     expect(blocked.body.error.code).toBe('UNVERIFIED');
 
-    const otp = (await db.one(`SELECT COUNT(*) AS n FROM otp_codes WHERE user_id = (SELECT id FROM users WHERE email = $1) AND used_at IS NULL`, [newUser.email])).n;
+    const otpUser = await db.findOne('users', { email: newUser.email });
+    const otp = await db.count('otp_codes', { user_id: otpUser.id, used_at: null });
     expect(otp).toBe(1);
 
     const wrong = await request(app).post('/api/auth/verify-otp').send({ identifier: newUser.email, code: '000000' });

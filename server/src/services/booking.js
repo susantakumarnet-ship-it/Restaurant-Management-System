@@ -1,17 +1,18 @@
 /**
  * Smart table booking engine.
  *
- * Concurrency: every write that claims tables runs in a transaction that first takes
- * row locks (SELECT ... FOR UPDATE) on all candidate `tables` rows, then re-checks overlaps
+ * Concurrency: every write that claims tables runs in a MongoDB transaction that first takes
+ * write locks (db.lock) on all candidate `tables` documents, then re-checks overlaps
  * against `reservation_tables`. Two concurrent requests for the same table therefore serialise:
- * the second one waits for the first to commit, then sees its rows and fails cleanly.
+ * the second one hits a write conflict, is retried after the first commits, then sees its rows
+ * and fails cleanly.
  *
  * Overlap rule with buffer B: existing [s1,e1) conflicts with new [s2,e2) when
  *   s1 < e2 + B  AND  e1 + B > s2
  */
 import { db } from '../db/index.js';
-import { badRequest, conflict, forbidden, notFound } from '../utils/http.js';
-import { addMinutes, fromMinutes, localDate, localIso, makeCode, parseLocal, toMinutes } from '../utils/common.js';
+import { HttpError, badRequest, conflict, forbidden, notFound } from '../utils/http.js';
+import { addMinutes, fromMinutes, localDate, localIso, makeCode, parseLocal, toLocalTs, toMinutes } from '../utils/common.js';
 import { notify } from './notify.js';
 
 export const RES_STATUSES = ['pending', 'confirmed', 'rejected', 'checked_in', 'seated', 'completed', 'cancelled', 'no_show'];
@@ -29,17 +30,37 @@ export const TRANSITIONS = {
   no_show: [],
 };
 
-export async function getBranchConfig(branchId, q = db) {
-  const row = await q.one(
-    `SELECT b.id, b.name, b.restaurant_id, b.opening_time, b.closing_time, b.weekly_holidays, (b.is_active AND r.is_active) AS is_active,
-            b.phone AS branch_phone, r.name AS restaurant_name, s.*
-       FROM restaurant_branches b
-       JOIN restaurants r ON r.id = b.restaurant_id
-       JOIN restaurant_settings s ON s.branch_id = b.id
-      WHERE b.id = $1`,
-    [branchId]
-  );
-  if (!row) throw notFound('Branch');
+/** Shift a local 'YYYY-MM-DDTHH:mm:ss' timestamp by N minutes. */
+const shiftIso = (iso, mins) => localIso(addMinutes(parseLocal(iso), mins));
+
+/** FK existence check (PostgreSQL used to reject dangling references with 23503 -> 409 IN_USE). */
+async function mustExist(col, id) {
+  if (id == null) return;
+  if (!(await db.exists(col, { id: Number(id) }))) {
+    const e = new Error('This record is referenced by other data and cannot be removed or linked.');
+    e.code = 'IN_USE';
+    throw e;
+  }
+}
+
+export async function getBranchConfig(branchId, q = db) { // eslint-disable-line no-unused-vars
+  const b = await db.byId('restaurant_branches', branchId);
+  if (!b) throw notFound('Branch');
+  const r = await db.byId('restaurants', b.restaurant_id);
+  const s = await db.findOne('restaurant_settings', { branch_id: b.id });
+  if (!r || !s) throw notFound('Branch');
+  const row = {
+    id: b.id,
+    name: b.name,
+    restaurant_id: b.restaurant_id,
+    opening_time: b.opening_time,
+    closing_time: b.closing_time,
+    weekly_holidays: b.weekly_holidays,
+    is_active: !!(b.is_active && r.is_active),
+    branch_phone: b.phone,
+    restaurant_name: r.name,
+    ...s,
+  };
   row.id = branchId;
   return row;
 }
@@ -73,36 +94,43 @@ function validateGuests(cfg, guests) {
   if (guests > cfg.max_guests) throw badRequest(`Maximum ${cfg.max_guests} guests per booking. Please call us for larger groups.`);
 }
 
-const overlapSql = `
-  SELECT DISTINCT rt.table_id
-    FROM reservation_tables rt
-   WHERE rt.active
-     AND rt.table_id = ANY($1::int[])
-     AND rt.start_at < ($3::timestamp + make_interval(mins => $4::int))
-     AND (rt.end_at + make_interval(mins => $4::int)) > $2::timestamp
-     AND rt.reservation_id <> $5::int`;
+/** Table ids (of `ids`) that have an active booking overlapping [startIso, endIso) incl. buffer. */
+async function busyTableIds(ids, startIso, endIso, bufferMin, excludeId) {
+  const rows = await db.find(
+    'reservation_tables',
+    {
+      active: true,
+      table_id: { $in: ids },
+      start_at: { $lt: shiftIso(endIso, bufferMin) },
+      end_at: { $gt: shiftIso(startIso, -bufferMin) },
+      reservation_id: { $ne: Number(excludeId) || 0 },
+    },
+    { projection: { table_id: 1 } }
+  );
+  return new Set(rows.map((r) => r.table_id));
+}
 
-async function candidateTables(q, branchId, { guests, sectionId, tableIds }) {
+async function withSections(tables) {
+  const sections = await db.mapByIds('table_sections', tables.map((t) => t.section_id), { projection: { name: 1, location_type: 1 } });
+  return tables.map((t) => {
+    const s = sections.get(t.section_id);
+    return { ...t, section_name: s ? s.name : null, location_type: s ? s.location_type : null };
+  });
+}
+
+async function candidateTables(q, branchId, { guests, sectionId, tableIds }) { // eslint-disable-line no-unused-vars
+  const bid = Number(branchId);
   if (tableIds?.length) {
-    const rows = await q.many(
-      `SELECT t.*, s.name AS section_name, s.location_type FROM tables t
-         LEFT JOIN table_sections s ON s.id = t.section_id
-        WHERE t.id = ANY($1::int[]) AND t.branch_id = $2 ORDER BY t.id`,
-      [tableIds, branchId]
-    );
+    const wanted = [...new Set(tableIds.map(Number))];
+    const rows = await withSections(await db.find('tables', { id: { $in: wanted }, branch_id: bid }, { sort: { id: 1 } }));
     if (rows.length !== new Set(tableIds).size) throw badRequest('One or more selected tables do not exist in this branch');
     const bad = rows.find((t) => !t.is_active || t.status === 'maintenance');
     if (bad) throw conflict(`Table ${bad.table_number} is not available (under maintenance or inactive)`, 'TABLE_UNAVAILABLE');
     return rows;
   }
-  return q.many(
-    `SELECT t.*, s.name AS section_name, s.location_type FROM tables t
-       LEFT JOIN table_sections s ON s.id = t.section_id
-      WHERE t.branch_id = $1 AND t.is_active AND t.status <> 'maintenance'
-        AND t.capacity >= $2 AND ($3::int IS NULL OR t.section_id = $3::int)
-      ORDER BY t.capacity, t.min_capacity DESC, t.id`,
-    [branchId, guests, sectionId || null]
-  );
+  const filter = { branch_id: bid, is_active: true, status: { $ne: 'maintenance' }, capacity: { $gte: guests } };
+  if (sectionId) filter.section_id = Number(sectionId);
+  return withSections(await db.find('tables', filter, { sort: { capacity: 1, min_capacity: -1, id: 1 } }));
 }
 
 const publicTable = (t) => ({
@@ -133,11 +161,16 @@ export async function getAvailability({ branchId, date, guests, sectionId, exclu
   const dayStart = `${date}T00:00:00`;
   const dayEnd = localIso(addMinutes(parseLocal(dayStart), 1440 + cfg.buffer_min));
   const blocks = ids.length
-    ? await db.many(
-        `SELECT table_id, start_at, end_at FROM reservation_tables
-          WHERE active AND table_id = ANY($1::int[]) AND start_at < $2::timestamp
-            AND end_at > ($3::timestamp - make_interval(mins => $4::int)) AND reservation_id <> $5`,
-        [ids, dayEnd, dayStart, cfg.buffer_min, excludeReservationId]
+    ? await db.find(
+        'reservation_tables',
+        {
+          active: true,
+          table_id: { $in: ids },
+          start_at: { $lt: dayEnd },
+          end_at: { $gt: shiftIso(dayStart, -cfg.buffer_min) },
+          reservation_id: { $ne: Number(excludeReservationId) || 0 },
+        },
+        { projection: { table_id: 1, start_at: 1, end_at: 1 } }
       )
     : [];
   const blocksByTable = new Map();
@@ -164,8 +197,9 @@ async function claimTables(t, cfg, { branchId, startIso, endIso, guests, section
   const candidates = await candidateTables(t, branchId, { guests, sectionId, tableIds });
   if (!candidates.length) throw conflict('No table can accommodate this party size in the selected area', 'NO_AVAILABILITY');
   const ids = candidates.map((c) => c.id);
-  await t.query('SELECT id FROM tables WHERE id = ANY($1::int[]) ORDER BY id FOR UPDATE', [ids]);
-  const busy = new Set((await t.many(overlapSql, [ids, startIso, endIso, cfg.buffer_min, excludeId])).map((r) => r.table_id));
+  // Replacement for SELECT ... FOR UPDATE: concurrent claimers of the same tables write-conflict and retry.
+  await db.lock('tables', { id: { $in: ids } });
+  const busy = await busyTableIds(ids, startIso, endIso, cfg.buffer_min, excludeId);
 
   if (tableIds?.length) {
     const taken = candidates.filter((c) => busy.has(c.id));
@@ -195,33 +229,53 @@ function computeTimes(cfg, date, time, { admin }) {
   return { startIso: localIso(start), endIso: localIso(end) };
 }
 
-async function addHistory(t, reservationId, from, to, userId, note) {
-  await t.query(
-    `INSERT INTO reservation_status_history(reservation_id, from_status, to_status, changed_by, note) VALUES ($1,$2,$3,$4,$5)`,
-    [reservationId, from, to, userId || null, note || null]
+async function addHistory(t, reservationId, from, to, userId, note) { // eslint-disable-line no-unused-vars
+  await db.insert('reservation_status_history', {
+    reservation_id: Number(reservationId),
+    from_status: from,
+    to_status: to,
+    changed_by: userId || null,
+    note: note || null,
+  });
+}
+
+async function insertReservationTables(reservationId, tables, startIso, endIso) {
+  await db.insertMany(
+    'reservation_tables',
+    tables.map((tb) => ({ reservation_id: reservationId, table_id: tb.id, start_at: startIso, end_at: endIso }))
   );
 }
 
-export async function getReservation(id, q = db) {
-  const r = await q.one(
-    `SELECT r.*, b.name AS branch_name, b.address AS branch_address, b.phone AS branch_phone,
-            rest.name AS restaurant_name, rest.logo_url, s.name AS section_name,
-            COALESCE((SELECT json_agg(json_build_object('id', t.id, 'table_number', t.table_number, 'name', t.name,
-                       'capacity', t.capacity, 'section_name', ts.name) ORDER BY t.table_number)
-                       FROM reservation_tables rt JOIN tables t ON t.id = rt.table_id
-                       LEFT JOIN table_sections ts ON ts.id = t.section_id
-                      WHERE rt.reservation_id = r.id), '[]'::json) AS tables,
-            cu.user_id
-       FROM reservations r
-       JOIN restaurant_branches b ON b.id = r.branch_id
-       JOIN restaurants rest ON rest.id = b.restaurant_id
-       LEFT JOIN table_sections s ON s.id = r.section_id
-       LEFT JOIN customers cu ON cu.id = r.customer_id
-      WHERE r.id = $1`,
-    [id]
-  );
+export async function getReservation(id, q = db) { // eslint-disable-line no-unused-vars
+  const r = await db.byId('reservations', id);
   if (!r) throw notFound('Reservation');
-  return r;
+  const b = await db.byId('restaurant_branches', r.branch_id);
+  if (!b) throw notFound('Reservation');
+  const rest = await db.byId('restaurants', b.restaurant_id);
+  if (!rest) throw notFound('Reservation');
+  const section = r.section_id != null ? await db.byId('table_sections', r.section_id, { projection: { name: 1 } }) : null;
+  const cu = r.customer_id != null ? await db.byId('customers', r.customer_id, { projection: { user_id: 1 } }) : null;
+
+  const rts = await db.find('reservation_tables', { reservation_id: r.id }, { projection: { table_id: 1 } });
+  const tmap = await db.mapByIds('tables', rts.map((x) => x.table_id));
+  const smap = await db.mapByIds('table_sections', [...tmap.values()].map((t) => t.section_id), { projection: { name: 1 } });
+  const tables = rts
+    .map((x) => tmap.get(x.table_id))
+    .filter(Boolean)
+    .map((t) => ({ id: t.id, table_number: t.table_number, name: t.name, capacity: t.capacity, section_name: smap.get(t.section_id)?.name ?? null }))
+    .sort((a, z) => (a.table_number < z.table_number ? -1 : a.table_number > z.table_number ? 1 : 0));
+
+  return {
+    ...r,
+    branch_name: b.name,
+    branch_address: b.address,
+    branch_phone: b.phone,
+    restaurant_name: rest.name,
+    logo_url: rest.logo_url,
+    section_name: section ? section.name : null,
+    tables,
+    user_id: cu ? cu.user_id : null,
+  };
 }
 
 const fmtWhen = (r) => {
@@ -247,8 +301,8 @@ export async function createReservation({ branchId, input, actor, admin = false,
   const customerId = admin ? input.customer_id || null : actor.customer_id;
   if (!admin && !customerId) throw forbidden('Only customer accounts can make online bookings');
 
-  const created = await db.tx(async (t) => {
-    const tables = await claimTables(t, cfg, {
+  const created = await db.tx(async () => {
+    const tables = await claimTables(null, cfg, {
       branchId,
       startIso,
       endIso,
@@ -256,29 +310,36 @@ export async function createReservation({ branchId, input, actor, admin = false,
       sectionId: input.section_id,
       tableIds: input.table_ids,
     });
-    let row;
-    for (let attempt = 0; attempt < 5 && !row; attempt++) {
-      const code = makeCode('BK');
-      row = await t.one(
-        `INSERT INTO reservations(booking_code, branch_id, customer_id, customer_name, phone, email, booking_date,
-            start_at, end_at, guests, section_id, seating_preference, occasion, special_requests, status, source,
-            advance_amount, payment_status, admin_notes, created_by)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)
-         ON CONFLICT (booking_code) DO NOTHING RETURNING id`,
-        [
-          code, branchId, customerId, input.customer_name, input.phone, input.email || null, input.date,
-          startIso, endIso, guests, input.section_id || null, input.seating_preference || null, input.occasion || null,
-          input.special_requests || null, status, source || (admin ? 'admin' : 'online'),
-          requiresAdvance ? cfg.advance_payment_amount : 0, requiresAdvance ? 'pending' : 'not_required',
-          admin ? input.admin_notes || null : null, actor?.id || null,
-        ]
-      );
-    }
-    for (const tb of tables) {
-      await t.query(`INSERT INTO reservation_tables(reservation_id, table_id, start_at, end_at) VALUES ($1,$2,$3,$4)`, [row.id, tb.id, startIso, endIso]);
-    }
-    if (status === 'seated') await t.query(`UPDATE tables SET status = 'occupied' WHERE id = ANY($1::int[])`, [tables.map((x) => x.id)]);
-    await addHistory(t, row.id, null, status, actor?.id, admin ? 'Created by staff' : 'Booking submitted online');
+    await mustExist('customers', customerId);
+    await mustExist('table_sections', input.section_id || null);
+    // A duplicate key inside a transaction aborts it, so pick a free code first (ON CONFLICT DO NOTHING retry).
+    let code = makeCode('BK');
+    for (let attempt = 0; attempt < 4 && (await db.exists('reservations', { booking_code: code })); attempt++) code = makeCode('BK');
+    const row = await db.insert('reservations', {
+      booking_code: code,
+      branch_id: Number(branchId),
+      customer_id: customerId != null ? Number(customerId) : null,
+      customer_name: input.customer_name,
+      phone: input.phone,
+      email: input.email || null,
+      booking_date: input.date,
+      start_at: startIso,
+      end_at: endIso,
+      guests,
+      section_id: input.section_id ? Number(input.section_id) : null,
+      seating_preference: input.seating_preference || null,
+      occasion: input.occasion || null,
+      special_requests: input.special_requests || null,
+      status,
+      source: source || (admin ? 'admin' : 'online'),
+      advance_amount: requiresAdvance ? Number(cfg.advance_payment_amount) : 0,
+      payment_status: requiresAdvance ? 'pending' : 'not_required',
+      admin_notes: admin ? input.admin_notes || null : null,
+      created_by: actor?.id || null,
+    });
+    await insertReservationTables(row.id, tables, startIso, endIso);
+    if (status === 'seated') await db.updateMany('tables', { id: { $in: tables.map((x) => x.id) } }, { status: 'occupied' });
+    await addHistory(null, row.id, null, status, actor?.id, admin ? 'Created by staff' : 'Booking submitted online');
     return row;
   });
 
@@ -326,7 +387,7 @@ export async function modifyReservation({ id, changes, actor, admin = false }) {
   validateGuests(cfg, guests);
   const scheduleChanged = date !== r.booking_date || time !== r.start_at.slice(11, 16) || guests !== r.guests || changes.table_ids || changes.section_id !== undefined;
 
-  await db.tx(async (t) => {
+  await db.tx(async () => {
     let startIso = r.start_at;
     let endIso = r.end_at;
     if (scheduleChanged) {
@@ -341,30 +402,32 @@ export async function modifyReservation({ id, changes, actor, admin = false }) {
       }
       let tables;
       try {
-        tables = await claimTables(t, cfg, { branchId: r.branch_id, startIso, endIso, guests, sectionId, tableIds, excludeId: r.id });
+        tables = await claimTables(null, cfg, { branchId: r.branch_id, startIso, endIso, guests, sectionId, tableIds, excludeId: r.id });
       } catch (e) {
-        if (changes.table_ids || !tableIds) throw e;
-        tables = await claimTables(t, cfg, { branchId: r.branch_id, startIso, endIso, guests, sectionId, excludeId: r.id });
+        // Database errors (e.g. transient write conflicts) abort the transaction: let db.tx retry it.
+        if (changes.table_ids || !tableIds || !(e instanceof HttpError)) throw e;
+        tables = await claimTables(null, cfg, { branchId: r.branch_id, startIso, endIso, guests, sectionId, excludeId: r.id });
       }
-      await t.query('DELETE FROM reservation_tables WHERE reservation_id = $1', [r.id]);
-      for (const tb of tables) {
-        await t.query(`INSERT INTO reservation_tables(reservation_id, table_id, start_at, end_at) VALUES ($1,$2,$3,$4)`, [r.id, tb.id, startIso, endIso]);
-      }
+      await db.remove('reservation_tables', { reservation_id: r.id });
+      await insertReservationTables(r.id, tables, startIso, endIso);
     }
     const newStatus = !admin && r.status === 'confirmed' && scheduleChanged && !cfg.auto_confirm ? 'pending' : r.status;
     // Only fields present in the request are changed; an explicit null/'' clears an optional field.
     const optional = { email: changes.email, occasion: changes.occasion, special_requests: changes.special_requests, seating_preference: changes.seating_preference, section_id: changes.section_id };
     if (admin) optional.admin_notes = changes.admin_notes;
-    const sets = ['booking_date = $2', 'start_at = $3', 'end_at = $4', 'guests = $5', 'status = $6', 'updated_at = now()'];
-    const params = [r.id, date, startIso, endIso, guests, newStatus];
+    const set = { booking_date: date, start_at: startIso, end_at: endIso, guests, status: newStatus, updated_at: new Date() };
     for (const [k, v] of Object.entries({ customer_name: changes.customer_name, phone: changes.phone })) {
-      if (v) (params.push(v), sets.push(`${k} = $${params.length}`));
+      if (v) set[k] = v;
     }
     for (const [k, v] of Object.entries(optional)) {
-      if (v !== undefined) (params.push(v === '' ? null : v), sets.push(`${k} = $${params.length}`));
+      if (v !== undefined) set[k] = v === '' ? null : v;
     }
-    await t.query(`UPDATE reservations SET ${sets.join(', ')} WHERE id = $1`, params);
-    await addHistory(t, r.id, r.status, newStatus, actor.id, scheduleChanged ? `Modified: ${date} ${time}, ${guests} guests` : 'Details updated');
+    if (set.section_id != null) {
+      set.section_id = Number(set.section_id);
+      await mustExist('table_sections', set.section_id);
+    }
+    await db.update('reservations', { id: r.id }, { $set: set });
+    await addHistory(null, r.id, r.status, newStatus, actor.id, scheduleChanged ? `Modified: ${date} ${time}, ${guests} guests` : 'Details updated');
   });
 
   const updated = await getReservation(id);
@@ -407,34 +470,38 @@ export async function changeStatus({ id, status, actor, note, byCustomer = false
   if (!TRANSITIONS[r.status].includes(status)) throw badRequest(`Cannot change booking from ${r.status} to ${status}`);
   if (status === 'confirmed' && r.tables.length === 0) throw badRequest('Assign a table before confirming this booking');
 
-  await db.tx(async (t) => {
-    const locked = await t.one('SELECT status FROM reservations WHERE id = $1 FOR UPDATE', [id]);
-    if (locked.status !== r.status) throw conflict('This booking was updated by someone else. Please refresh.');
-    const extra = status === 'cancelled' ? ', cancelled_at = now(), cancel_reason = $3' : status === 'rejected' ? ', admin_notes = COALESCE($3, admin_notes)' : '';
-    const params = [id, status];
-    if (extra) params.push(note || null);
-    await t.query(`UPDATE reservations SET status = $2, updated_at = now() ${extra} WHERE id = $1`, params);
+  await db.tx(async () => {
+    const set = { status, updated_at: new Date() };
+    if (status === 'cancelled') Object.assign(set, { cancelled_at: new Date(), cancel_reason: note || null });
+    else if (status === 'rejected' && note) set.admin_notes = note;
+    // Guarded transition (replaces SELECT ... FOR UPDATE + status re-check).
+    const moved = await db.findOneAndUpdate('reservations', { id: r.id, status: r.status }, { $set: set }, { projection: { id: 1 } });
+    if (!moved) throw conflict('This booking was updated by someone else. Please refresh.');
     const tableIds = r.tables.map((x) => x.id);
     if (RELEASING.includes(status)) {
-      await t.query('UPDATE reservation_tables SET active = false WHERE reservation_id = $1', [id]);
-      if (r.status === 'seated') await t.query(`UPDATE tables SET status = 'available' WHERE id = ANY($1::int[])`, [tableIds]);
+      await db.updateMany('reservation_tables', { reservation_id: r.id }, { active: false });
+      if (r.status === 'seated') await db.updateMany('tables', { id: { $in: tableIds } }, { status: 'available' });
     }
-    if (status === 'seated' && tableIds.length) await t.query(`UPDATE tables SET status = 'occupied' WHERE id = ANY($1::int[])`, [tableIds]);
+    if (status === 'seated' && tableIds.length) await db.updateMany('tables', { id: { $in: tableIds } }, { status: 'occupied' });
     if (status === 'completed') {
-      // Free the tables from now on (guests may leave early).
-      await t.query(
-        `UPDATE reservation_tables SET end_at = GREATEST(start_at + interval '1 minute', LEAST(end_at, $2::timestamp)) WHERE reservation_id = $1`,
-        [id, localIso()]
-      );
-      if (tableIds.length) await t.query(`UPDATE tables SET status = 'available' WHERE id = ANY($1::int[])`, [tableIds]);
+      // Free the tables from now on (guests may leave early): end_at = GREATEST(start_at + 1 min, LEAST(end_at, now)).
+      const nowIso = localIso();
+      const rts = await db.find('reservation_tables', { reservation_id: r.id }, { projection: { table_id: 1, start_at: 1, end_at: 1 } });
+      for (const rt of rts) {
+        const least = rt.end_at < nowIso ? rt.end_at : nowIso;
+        const minEnd = shiftIso(rt.start_at, 1);
+        const end = least > minEnd ? least : minEnd;
+        if (end !== rt.end_at) await db.update('reservation_tables', { reservation_id: r.id, table_id: rt.table_id }, { end_at: end });
+      }
+      if (tableIds.length) await db.updateMany('tables', { id: { $in: tableIds } }, { status: 'available' });
     }
-    await addHistory(t, id, r.status, status, actor?.id, note || (byCustomer ? 'Cancelled by customer' : null));
+    await addHistory(null, r.id, r.status, status, actor?.id, note || (byCustomer ? 'Cancelled by customer' : null));
   });
 
   // Refund paid advances when the booking is rejected or cancelled (within policy).
   if (['rejected', 'cancelled'].includes(status) && ['paid', 'partially_paid'].includes(r.payment_status)) {
     const { refundReservationAdvance } = await import('./payments.js');
-    await refundReservationAdvance(id, actor, status === 'rejected' ? 'Booking rejected' : 'Booking cancelled');
+    await refundReservationAdvance(r.id, actor, status === 'rejected' ? 'Booking rejected' : 'Booking cancelled');
   }
 
   const updated = await getReservation(id);
@@ -465,8 +532,8 @@ export async function assignTables({ id, tableIds, actor }) {
   const r = await getReservation(id);
   if (!ACTIVE_STATUSES.includes(r.status)) throw badRequest(`Cannot assign tables to a ${r.status} booking`);
   const cfg = await getBranchConfig(r.branch_id);
-  await db.tx(async (t) => {
-    const tables = await claimTables(t, cfg, {
+  await db.tx(async () => {
+    const tables = await claimTables(null, cfg, {
       branchId: r.branch_id,
       startIso: r.start_at,
       endIso: r.end_at,
@@ -474,44 +541,80 @@ export async function assignTables({ id, tableIds, actor }) {
       tableIds,
       excludeId: r.id,
     });
-    await t.query('DELETE FROM reservation_tables WHERE reservation_id = $1', [r.id]);
-    for (const tb of tables) {
-      await t.query(`INSERT INTO reservation_tables(reservation_id, table_id, start_at, end_at) VALUES ($1,$2,$3,$4)`, [r.id, tb.id, r.start_at, r.end_at]);
-    }
-    await addHistory(t, r.id, r.status, r.status, actor.id, `Tables assigned: ${tables.map((x) => x.table_number).join(', ')}`);
+    await db.remove('reservation_tables', { reservation_id: r.id });
+    await insertReservationTables(r.id, tables, r.start_at, r.end_at);
+    await addHistory(null, r.id, r.status, r.status, actor.id, `Tables assigned: ${tables.map((x) => x.table_number).join(', ')}`);
   });
   return getReservation(id);
 }
 
 /** Live floor status for each table at a point in time. */
 export async function liveTableStatus(branchId, at = localIso()) {
-  return db.many(
-    `SELECT t.*, s.name AS section_name, s.location_type,
-       cur.id AS current_reservation_id, cur.booking_code AS current_booking_code, cur.customer_name AS current_customer,
-       cur.status AS current_reservation_status, cur.guests AS current_guests, cur.start_at AS current_start, cur.end_at AS current_end,
-       nxt.id AS next_reservation_id, nxt.booking_code AS next_booking_code, nxt.start_at AS next_start, nxt.customer_name AS next_customer,
-       (SELECT COUNT(*) FROM orders o WHERE o.table_id = t.id AND o.order_type = 'dine_in'
-          AND o.status NOT IN ('completed','cancelled')) AS open_orders,
-       CASE
-         WHEN t.status = 'maintenance' THEN 'maintenance'
-         WHEN t.status = 'occupied' OR cur.status IN ('seated','checked_in') THEN 'occupied'
-         WHEN cur.id IS NOT NULL OR nxt.start_at < ($2::timestamp + interval '60 minutes') THEN 'reserved'
-         ELSE 'available'
-       END AS live_status
-     FROM tables t
-     LEFT JOIN table_sections s ON s.id = t.section_id
-     LEFT JOIN LATERAL (
-       SELECT r.* FROM reservation_tables rt JOIN reservations r ON r.id = rt.reservation_id
-        WHERE rt.table_id = t.id AND rt.active AND r.status IN ('pending','confirmed','checked_in','seated')
-          AND rt.start_at <= $2::timestamp AND rt.end_at > $2::timestamp
-        ORDER BY rt.start_at LIMIT 1) cur ON true
-     LEFT JOIN LATERAL (
-       SELECT r.* FROM reservation_tables rt JOIN reservations r ON r.id = rt.reservation_id
-        WHERE rt.table_id = t.id AND rt.active AND r.status IN ('pending','confirmed')
-          AND rt.start_at > $2::timestamp AND r.booking_date = $3::date
-        ORDER BY rt.start_at LIMIT 1) nxt ON true
-     WHERE t.branch_id = $1 AND t.is_active
-     ORDER BY s.name NULLS LAST, t.table_number`,
-    [branchId, at, at.slice(0, 10)]
+  at = toLocalTs(at);
+  const day = at.slice(0, 10);
+  const nextDay = localDate(addMinutes(parseLocal(`${day}T00:00:00`), 1440 + 60));
+  const tables = await withSections(await db.find('tables', { branch_id: Number(branchId), is_active: true }));
+  const ids = tables.map((t) => t.id);
+  if (!ids.length) return [];
+
+  // Candidate bookings: running at `at`, or starting later (next ones are limited to the same booking_date).
+  const rts = await db.find(
+    'reservation_tables',
+    {
+      table_id: { $in: ids },
+      active: true,
+      $or: [{ start_at: { $lte: at }, end_at: { $gt: at } }, { start_at: { $gt: at, $lt: `${nextDay}T00:00:00` } }],
+    },
+    { sort: { start_at: 1 } }
   );
+  const resMap = await db.mapByIds('reservations', rts.map((x) => x.reservation_id));
+  const openOrders = await db.aggregate('orders', [
+    { $match: { table_id: { $in: ids }, order_type: 'dine_in', status: { $nin: ['completed', 'cancelled'] } } },
+    { $group: { _id: '$table_id', n: { $sum: 1 } } },
+  ]);
+  const openByTable = new Map(openOrders.map((o) => [o._id, o.n]));
+
+  const curStatuses = ['pending', 'confirmed', 'checked_in', 'seated'];
+  const nextStatuses = ['pending', 'confirmed'];
+  const soon = shiftIso(at, 60);
+
+  const out = tables.map((t) => {
+    const mine = rts.filter((x) => x.table_id === t.id);
+    const curRt = mine.find((x) => x.start_at <= at && x.end_at > at && curStatuses.includes(resMap.get(x.reservation_id)?.status));
+    const nxtRt = mine.find((x) => {
+      const rs = resMap.get(x.reservation_id);
+      return x.start_at > at && rs && nextStatuses.includes(rs.status) && rs.booking_date === day;
+    });
+    const cur = curRt ? resMap.get(curRt.reservation_id) : null;
+    const nxt = nxtRt ? resMap.get(nxtRt.reservation_id) : null;
+    let live;
+    if (t.status === 'maintenance') live = 'maintenance';
+    else if (t.status === 'occupied' || (cur && ['seated', 'checked_in'].includes(cur.status))) live = 'occupied';
+    else if (cur || (nxt && nxt.start_at < soon)) live = 'reserved';
+    else live = 'available';
+    return {
+      ...t,
+      current_reservation_id: cur ? cur.id : null,
+      current_booking_code: cur ? cur.booking_code : null,
+      current_customer: cur ? cur.customer_name : null,
+      current_reservation_status: cur ? cur.status : null,
+      current_guests: cur ? cur.guests : null,
+      current_start: cur ? cur.start_at : null,
+      current_end: cur ? cur.end_at : null,
+      next_reservation_id: nxt ? nxt.id : null,
+      next_booking_code: nxt ? nxt.booking_code : null,
+      next_start: nxt ? nxt.start_at : null,
+      next_customer: nxt ? nxt.customer_name : null,
+      open_orders: openByTable.get(t.id) || 0,
+      live_status: live,
+    };
+  });
+  // ORDER BY s.name NULLS LAST, t.table_number
+  const cmp = (a, b) => (a < b ? -1 : a > b ? 1 : 0);
+  out.sort((a, b) => {
+    if (a.section_name == null && b.section_name != null) return 1;
+    if (a.section_name != null && b.section_name == null) return -1;
+    return cmp(a.section_name ?? '', b.section_name ?? '') || cmp(a.table_number, b.table_number);
+  });
+  return out;
 }

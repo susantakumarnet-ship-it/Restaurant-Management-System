@@ -23,7 +23,7 @@ describe('Admin CRUD', () => {
   });
 
   it('rejects foreign keys from another tenant', async () => {
-    const other = await db.one(`INSERT INTO table_sections(branch_id, name) VALUES ($1,'Foreign') RETURNING id`, [fx.B.branchId]);
+    const other = await db.insert('table_sections', { branch_id: fx.B.branchId, name: 'Foreign' });
     const res = await admin.post('/api/admin/tables', { table_number: 'X2', capacity: 2, table_type: '2_seater', section_id: other.id });
     expect(res.status).toBe(400);
   });

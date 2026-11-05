@@ -4,47 +4,115 @@ import { z } from 'zod';
 import { db } from '../../db/index.js';
 import { ah, badRequest, conflict, forbidden, notFound, validate } from '../../utils/http.js';
 import { clearAuthCache, requirePerm } from '../../middleware/auth.js';
-import { buildUpdate, localDate, round2 } from '../../utils/common.js';
+import { definedOnly, ilike, localDate, localIso, parseLocal, round2, toTime } from '../../utils/common.js';
 import { notify } from '../../services/notify.js';
 import { crud, zs } from './crud.js';
 
 const r = Router();
 const pid = (req) => parseInt(req.params.id, 10) || 0;
+const ci = { locale: 'en', strength: 2 };
+
+/** 'YYYY-MM-DD' + n days (calendar arithmetic). */
+const addDays = (s, n) => {
+  const d = new Date(`${s}T00:00:00Z`);
+  d.setUTCDate(d.getUTCDate() + n);
+  return d.toISOString().slice(0, 10);
+};
+const dayDiff = (a, b) => Math.round((Date.parse(`${a}T00:00:00Z`) - Date.parse(`${b}T00:00:00Z`)) / 86400000);
 
 // ================= Customers =================
-const customerBase = `
-  FROM customers c JOIN users u ON u.id = c.user_id
-  WHERE (EXISTS (SELECT 1 FROM reservations x JOIN restaurant_branches b ON b.id = x.branch_id WHERE x.customer_id = c.id AND b.restaurant_id = $1)
-      OR EXISTS (SELECT 1 FROM orders x JOIN restaurant_branches b ON b.id = x.branch_id WHERE x.customer_id = c.id AND b.restaurant_id = $1)
-      OR EXISTS (SELECT 1 FROM reviews x JOIN restaurant_branches b ON b.id = x.branch_id WHERE x.user_id = c.user_id AND b.restaurant_id = $1))`;
+const branchIdsOf = (restaurantId) => db.distinct('restaurant_branches', 'id', { restaurant_id: restaurantId });
+
+/**
+ * Customers visible to a restaurant: they booked, ordered or reviewed at one of its branches.
+ * Returns the ids (optionally limited to `onlyIds`).
+ */
+async function restaurantCustomerIds(bids, onlyIds) {
+  const limit = onlyIds ? { customer_id: { $in: onlyIds } } : { customer_id: { $ne: null } };
+  const [rc, oc, reviewUsers] = await Promise.all([
+    db.distinct('reservations', 'customer_id', { branch_id: { $in: bids }, ...limit }),
+    db.distinct('orders', 'customer_id', { branch_id: { $in: bids }, ...limit }),
+    db.distinct('reviews', 'user_id', { branch_id: { $in: bids } }),
+  ]);
+  const ids = new Set([...rc, ...oc]);
+  if (reviewUsers.length) {
+    const filter = { user_id: { $in: reviewUsers } };
+    if (onlyIds) filter.id = { $in: onlyIds };
+    for (const id of await db.distinct('customers', 'id', filter)) ids.add(id);
+  }
+  return ids;
+}
+
+/** Customer (with user fields) scoped to the restaurant, or null. */
+async function scopedCustomer(req, id) {
+  const bids = await branchIdsOf(req.restaurantId);
+  const ids = await restaurantCustomerIds(bids, [id]);
+  if (!ids.has(id)) return null;
+  const c = await db.byId('customers', id);
+  if (!c) return null;
+  const u = await db.byId('users', c.user_id, { projection: { name: 1, email: 1, phone: 1, avatar_url: 1, created_at: 1, last_login_at: 1 } });
+  if (!u) return null;
+  return { c, u, bids };
+}
 
 r.get(
   '/customers',
   requirePerm('customers.view', 'customers.manage'),
   ah(async (req, res) => {
-    const params = [req.restaurantId];
-    let extra = '';
+    const bids = await branchIdsOf(req.restaurantId);
+    const ids = [...(await restaurantCustomerIds(bids))];
+    const filter = { id: { $in: ids } };
+    if (req.query.status) filter.status = req.query.status;
+    const customers = ids.length ? await db.find('customers', filter) : [];
+    const userFilter = { id: { $in: customers.map((c) => c.user_id) } };
     if (req.query.q) {
-      params.push(`%${String(req.query.q).trim()}%`);
-      extra += ` AND (u.name ILIKE $2 OR u.email ILIKE $2 OR u.phone ILIKE $2)`;
+      const q = ilike(req.query.q);
+      userFilter.$or = [{ name: q }, { email: q }, { phone: q }];
     }
-    if (req.query.status) {
-      params.push(req.query.status);
-      extra += ` AND c.status = $${params.length}`;
-    }
-    res.json(
-      await db.many(
-        `SELECT c.id, c.user_id, u.name, u.email, u.phone, u.avatar_url, c.loyalty_points, c.status, c.created_at,
-            (SELECT COUNT(*) FROM reservations x JOIN restaurant_branches b ON b.id = x.branch_id WHERE x.customer_id = c.id AND b.restaurant_id = $1) AS bookings,
-            (SELECT COUNT(*) FROM orders x JOIN restaurant_branches b ON b.id = x.branch_id WHERE x.customer_id = c.id AND b.restaurant_id = $1 AND x.status <> 'cancelled') AS orders,
-            (SELECT COALESCE(SUM(x.total),0) FROM orders x JOIN restaurant_branches b ON b.id = x.branch_id WHERE x.customer_id = c.id AND b.restaurant_id = $1 AND x.status <> 'cancelled') AS total_spent,
-            (SELECT MAX(x.start_at) FROM reservations x JOIN restaurant_branches b ON b.id = x.branch_id
-              WHERE x.customer_id = c.id AND b.restaurant_id = $1 AND x.status IN ('completed','seated','checked_in')
-                AND x.start_at <= LOCALTIMESTAMP) AS last_visit
-         ${customerBase} ${extra} ORDER BY total_spent DESC, c.id DESC LIMIT 1000`,
-        params
-      )
+    const users = new Map(
+      (customers.length ? await db.find('users', userFilter, { projection: { id: 1, name: 1, email: 1, phone: 1, avatar_url: 1 } }) : []).map((u) => [u.id, u])
     );
+    const list = customers.filter((c) => users.has(c.user_id));
+    const cids = list.map((c) => c.id);
+    const nowLocal = localIso();
+    const [bk, od, visits] = cids.length
+      ? await Promise.all([
+          db.aggregate('reservations', [{ $match: { customer_id: { $in: cids }, branch_id: { $in: bids } } }, { $group: { _id: '$customer_id', n: { $sum: 1 } } }]),
+          db.aggregate('orders', [
+            { $match: { customer_id: { $in: cids }, branch_id: { $in: bids }, status: { $ne: 'cancelled' } } },
+            { $group: { _id: '$customer_id', n: { $sum: 1 }, spent: { $sum: '$total' } } },
+          ]),
+          db.aggregate('reservations', [
+            { $match: { customer_id: { $in: cids }, branch_id: { $in: bids }, status: { $in: ['completed', 'seated', 'checked_in'] }, start_at: { $lte: nowLocal } } },
+            { $group: { _id: '$customer_id', last: { $max: '$start_at' } } },
+          ]),
+        ])
+      : [[], [], []];
+    const bkBy = new Map(bk.map((x) => [x._id, x.n]));
+    const odBy = new Map(od.map((x) => [x._id, x]));
+    const visitBy = new Map(visits.map((x) => [x._id, x.last]));
+    const rows = list
+      .map((c) => {
+        const u = users.get(c.user_id);
+        return {
+          id: c.id,
+          user_id: c.user_id,
+          name: u.name,
+          email: u.email,
+          phone: u.phone ?? null,
+          avatar_url: u.avatar_url ?? null,
+          loyalty_points: c.loyalty_points,
+          status: c.status,
+          created_at: c.created_at,
+          bookings: bkBy.get(c.id) || 0,
+          orders: odBy.get(c.id)?.n || 0,
+          total_spent: round2(odBy.get(c.id)?.spent || 0),
+          last_visit: visitBy.get(c.id) ?? null,
+        };
+      })
+      .sort((a, b) => b.total_spent - a.total_spent || b.id - a.id)
+      .slice(0, 1000);
+    res.json(rows);
   })
 );
 
@@ -52,29 +120,21 @@ r.get(
   '/customers/:id(\\d+)',
   requirePerm('customers.view', 'customers.manage'),
   ah(async (req, res) => {
-    const c = await db.one(
-      `SELECT c.*, u.name, u.email, u.phone, u.avatar_url, u.created_at AS registered_at, u.last_login_at ${customerBase} AND c.id = $2`,
-      [req.restaurantId, pid(req)]
-    );
-    if (!c) throw notFound('Customer');
-    const [bookings, orders, reviews] = await Promise.all([
-      db.many(
-        `SELECT x.id, x.booking_code, x.booking_date, x.start_at, x.guests, x.status, b.name AS branch_name
-           FROM reservations x JOIN restaurant_branches b ON b.id = x.branch_id WHERE x.customer_id = $1 AND b.restaurant_id = $2 ORDER BY x.start_at DESC`,
-        [c.id, req.restaurantId]
-      ),
-      db.many(
-        `SELECT x.id, x.order_code, x.order_type, x.total, x.status, x.payment_status, x.created_at
-           FROM orders x JOIN restaurant_branches b ON b.id = x.branch_id WHERE x.customer_id = $1 AND b.restaurant_id = $2 ORDER BY x.created_at DESC`,
-        [c.id, req.restaurantId]
-      ),
-      db.many(
-        `SELECT x.id, x.rating, x.comment, x.created_at, f.name AS food_name FROM reviews x
-           JOIN restaurant_branches b ON b.id = x.branch_id LEFT JOIN food_items f ON f.id = x.food_item_id
-          WHERE x.user_id = $1 AND b.restaurant_id = $2 ORDER BY x.created_at DESC`,
-        [c.user_id, req.restaurantId]
-      ),
+    const found = await scopedCustomer(req, pid(req));
+    if (!found) throw notFound('Customer');
+    const { c: cust, u, bids } = found;
+    const c = { ...cust, name: u.name, email: u.email, phone: u.phone ?? null, avatar_url: u.avatar_url ?? null, registered_at: u.created_at, last_login_at: u.last_login_at ?? null };
+    const [resv, orders, revs] = await Promise.all([
+      db.find('reservations', { customer_id: c.id, branch_id: { $in: bids } }, { sort: { start_at: -1 }, projection: { id: 1, booking_code: 1, booking_date: 1, start_at: 1, guests: 1, status: 1, branch_id: 1 } }),
+      db.find('orders', { customer_id: c.id, branch_id: { $in: bids } }, { sort: { created_at: -1 }, projection: { id: 1, order_code: 1, order_type: 1, total: 1, status: 1, payment_status: 1, created_at: 1 } }),
+      db.find('reviews', { user_id: c.user_id, branch_id: { $in: bids } }, { sort: { created_at: -1 }, projection: { id: 1, rating: 1, comment: 1, created_at: 1, food_item_id: 1 } }),
     ]);
+    const [branches, foods] = await Promise.all([
+      db.mapByIds('restaurant_branches', resv.map((x) => x.branch_id), { projection: { name: 1 } }),
+      db.mapByIds('food_items', revs.map((x) => x.food_item_id), { projection: { name: 1 } }),
+    ]);
+    const bookings = resv.map(({ branch_id, ...x }) => ({ ...x, branch_name: branches.get(branch_id)?.name ?? null }));
+    const reviews = revs.map(({ food_item_id, ...x }) => ({ ...x, food_name: foods.get(food_item_id)?.name ?? null }));
     const spent = round2(orders.filter((o) => o.status !== 'cancelled').reduce((s, o) => s + Number(o.total), 0));
     res.json({ ...c, restaurant_spent: spent, bookings, orders, reviews });
   })
@@ -85,12 +145,13 @@ r.patch(
   requirePerm('customers.manage'),
   validate(z.object({ status: z.enum(['active', 'blocked']).optional(), loyalty_points: z.number().int().min(0).optional(), notes: zs.optStr(2000) })),
   ah(async (req, res) => {
-    const c = await db.one(`SELECT c.id, c.user_id ${customerBase} AND c.id = $2`, [req.restaurantId, pid(req)]);
-    if (!c) throw notFound('Customer');
-    const { sets, values } = buildUpdate(req.body, { startIndex: 2 });
-    if (sets.length) await db.query(`UPDATE customers SET ${sets.join(', ')} WHERE id = $1`, [c.id, ...values]);
+    const found = await scopedCustomer(req, pid(req));
+    if (!found) throw notFound('Customer');
+    const { c } = found;
+    const data = definedOnly(req.body);
+    if (Object.keys(data).length) await db.update('customers', { id: c.id }, { $set: data });
     clearAuthCache(c.user_id);
-    res.json(await db.one('SELECT * FROM customers WHERE id = $1', [c.id]));
+    res.json(await db.byId('customers', c.id));
   })
 );
 
@@ -100,12 +161,31 @@ const employees = crud({
   scope: 'branch',
   perm: 'staff.manage',
   viewPerm: 'orders.manage',
-  search: ['t.name', 't.email', 't.phone'],
-  filters: { position: 't.position', status: 't.status' },
-  orderBy: 't.position, t.name',
-  select: `t.*, u.email AS login_email, ro.name AS login_role, u.is_active AS login_active,
-    (SELECT COUNT(*) FROM staff_shifts s WHERE s.employee_id = t.id AND s.shift_date >= CURRENT_DATE) AS upcoming_shifts`,
-  from: 'employees t LEFT JOIN users u ON u.id = t.user_id LEFT JOIN roles ro ON ro.id = u.role_id',
+  search: ['name', 'email', 'phone'],
+  filters: { position: 'position', status: 'status' },
+  sort: { position: 1, name: 1 },
+  // joined fields: login_email, login_role, login_active (LEFT JOIN users/roles) + upcoming_shifts count
+  enrich: async (rows) => {
+    const users = await db.mapByIds('users', rows.map((e) => e.user_id), { projection: { email: 1, role_id: 1, is_active: 1 } });
+    const roles = await db.mapByIds('roles', [...users.values()].map((u) => u.role_id), { projection: { name: 1 } });
+    const upcoming = rows.length
+      ? await db.aggregate('staff_shifts', [
+          { $match: { employee_id: { $in: rows.map((e) => e.id) }, shift_date: { $gte: localDate() } } },
+          { $group: { _id: '$employee_id', n: { $sum: 1 } } },
+        ])
+      : [];
+    const upBy = new Map(upcoming.map((x) => [x._id, x.n]));
+    return rows.map((e) => {
+      const u = users.get(e.user_id);
+      return {
+        ...e,
+        login_email: u?.email ?? null,
+        login_role: (u && roles.get(u.role_id)?.name) ?? null,
+        login_active: u ? u.is_active : null,
+        upcoming_shifts: upBy.get(e.id) || 0,
+      };
+    });
+  },
   schema: z.object({
     name: zs.str(120).min(2, 'Name is required'),
     email: zs.optStr(150),
@@ -119,9 +199,9 @@ const employees = crud({
   async afterSave(req, id, body) {
     // Terminating an employee disables their login.
     if (body.status === 'terminated') {
-      const e = await db.one('SELECT user_id FROM employees WHERE id = $1', [id]);
+      const e = await db.byId('employees', id, { projection: { user_id: 1 } });
       if (e?.user_id) {
-        await db.query('UPDATE users SET is_active = false WHERE id = $1', [e.user_id]);
+        await db.update('users', { id: e.user_id }, { $set: { is_active: false } });
         clearAuthCache(e.user_id);
       }
     }
@@ -138,26 +218,31 @@ r.post(
   validate(z.object({ email: z.string().trim().toLowerCase().email(), password: z.string().min(8).optional(), role: z.enum(STAFF_ASSIGNABLE), is_active: z.boolean().default(true) })),
   ah(async (req, res) => {
     const emp = await employees.getOne(req, pid(req));
-    const role = await db.one('SELECT id FROM roles WHERE name = $1', [req.body.role]);
+    const role = await db.findOne('roles', { name: req.body.role }, { projection: { id: 1 } });
     if (req.body.role === 'manager' && !['restaurant_admin', 'super_admin'].includes(req.user.role)) throw forbidden('Only restaurant admins can create manager accounts');
     let userId = emp.user_id;
     if (userId) {
-      await db.query(
-        `UPDATE users SET email = $2, role_id = $3, is_active = $4, password_hash = COALESCE($5, password_hash), updated_at = now() WHERE id = $1`,
-        [userId, req.body.email, role.id, req.body.is_active, req.body.password ? await bcrypt.hash(req.body.password, 10) : null]
-      );
+      const set = { email: req.body.email, role_id: role.id, is_active: req.body.is_active, updated_at: new Date() };
+      if (req.body.password) set.password_hash = await bcrypt.hash(req.body.password, 10);
+      await db.update('users', { id: userId }, { $set: set });
       clearAuthCache(userId);
     } else {
       if (!req.body.password) throw badRequest('Password is required for a new account');
-      const exists = await db.one('SELECT id FROM users WHERE lower(email) = $1', [req.body.email]);
+      const exists = await db.findOne('users', { email: req.body.email }, { projection: { id: 1 }, collation: ci });
       if (exists) throw conflict('This email is already used by another account');
-      const u = await db.one(
-        `INSERT INTO users(role_id, restaurant_id, branch_id, name, email, phone, password_hash, email_verified, is_active)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,true,$8) RETURNING id`,
-        [role.id, req.restaurantId, req.branchId, emp.name, req.body.email, emp.phone || null, await bcrypt.hash(req.body.password, 10), req.body.is_active]
-      );
+      const u = await db.insert('users', {
+        role_id: role.id,
+        restaurant_id: req.restaurantId,
+        branch_id: req.branchId,
+        name: emp.name,
+        email: req.body.email,
+        phone: emp.phone || null,
+        password_hash: await bcrypt.hash(req.body.password, 10),
+        email_verified: true,
+        is_active: req.body.is_active,
+      });
       userId = u.id;
-      await db.query('UPDATE employees SET user_id = $2 WHERE id = $1', [emp.id, userId]);
+      await db.update('employees', { id: emp.id }, { $set: { user_id: userId } });
       await notify({ type: 'staff_account', title: 'Your staff account is ready', message: `Hi ${emp.name}, you can now log in to the staff dashboard with ${req.body.email}.`, email: req.body.email, channels: ['email'] });
     }
     res.json(await employees.getOne(req, emp.id));
@@ -171,19 +256,16 @@ r.get(
   ah(async (req, res) => {
     const from = req.query.from || localDate();
     const to = req.query.to || from;
-    const params = [req.branchId, from, to];
-    let extra = '';
+    const emps = new Map((await db.find('employees', { branch_id: req.branchId }, { projection: { id: 1, name: 1, position: 1 } })).map((e) => [e.id, e]));
+    let empIds = [...emps.keys()];
     if (req.query.employeeId) {
-      params.push(parseInt(req.query.employeeId, 10));
-      extra = ` AND s.employee_id = $${params.length}`;
+      const only = parseInt(req.query.employeeId, 10);
+      empIds = empIds.filter((id) => id === only);
     }
-    res.json(
-      await db.many(
-        `SELECT s.*, s.shift_date::text AS shift_date, e.name AS employee_name, e.position FROM staff_shifts s JOIN employees e ON e.id = s.employee_id
-          WHERE e.branch_id = $1 AND s.shift_date BETWEEN $2 AND $3 ${extra} ORDER BY s.shift_date, s.start_time, e.name`,
-        params
-      )
-    );
+    const shifts = empIds.length ? await db.find('staff_shifts', { employee_id: { $in: empIds }, shift_date: { $gte: String(from), $lte: String(to) } }) : [];
+    const rows = shifts.map((s) => ({ ...s, employee_name: emps.get(s.employee_id).name, position: emps.get(s.employee_id).position }));
+    rows.sort((a, b) => (a.shift_date < b.shift_date ? -1 : a.shift_date > b.shift_date ? 1 : a.start_time < b.start_time ? -1 : a.start_time > b.start_time ? 1 : String(a.employee_name).localeCompare(String(b.employee_name))));
+    res.json(rows);
   })
 );
 
@@ -197,8 +279,8 @@ const shiftSchema = z.object({
 });
 
 async function scopedShift(req) {
-  const s = await db.one('SELECT s.* FROM staff_shifts s JOIN employees e ON e.id = s.employee_id WHERE s.id = $1 AND e.branch_id = $2', [pid(req), req.branchId]);
-  if (!s) throw notFound('Shift');
+  const s = await db.byId('staff_shifts', pid(req));
+  if (!s || !(await db.exists('employees', { id: s.employee_id, branch_id: req.branchId }))) throw notFound('Shift');
   return s;
 }
 
@@ -209,18 +291,24 @@ r.post(
   ah(async (req, res) => {
     const b = req.body;
     if (b.end_time <= b.start_time) throw badRequest('Shift end must be after start');
-    const emp = await db.one(`SELECT id FROM employees WHERE id = $1 AND branch_id = $2 AND status <> 'terminated'`, [b.employee_id, req.branchId]);
+    const emp = await db.findOne('employees', { id: b.employee_id, branch_id: req.branchId, status: { $ne: 'terminated' } }, { projection: { id: 1 } });
     if (!emp) throw badRequest('Invalid employee');
     const created = [];
     for (let i = 0; i <= b.repeat_days; i++) {
-      const d = new Date(`${b.shift_date}T00:00:00Z`);
-      d.setUTCDate(d.getUTCDate() + i);
-      const row = await db.one(
-        `INSERT INTO staff_shifts(employee_id, shift_date, start_time, end_time, notes, attendance_status)
-         VALUES ($1,$2,$3,$4,$5,COALESCE($6,'scheduled')) ON CONFLICT (employee_id, shift_date, start_time) DO NOTHING RETURNING *`,
-        [b.employee_id, d.toISOString().slice(0, 10), b.start_time, b.end_time, b.notes || null, b.attendance_status || null]
-      );
-      if (row) created.push(row);
+      try {
+        // unique (employee_id, shift_date, start_time) index => ON CONFLICT DO NOTHING
+        const row = await db.insert('staff_shifts', {
+          employee_id: b.employee_id,
+          shift_date: addDays(b.shift_date, i),
+          start_time: toTime(b.start_time),
+          end_time: toTime(b.end_time),
+          notes: b.notes || null,
+          attendance_status: b.attendance_status || 'scheduled',
+        });
+        created.push(row);
+      } catch (e) {
+        if (e?.code !== 11000) throw e;
+      }
     }
     if (!created.length) throw conflict('This shift already exists');
     res.status(201).json(created);
@@ -236,9 +324,11 @@ r.put(
     const start = (req.body.start_time || s.start_time).slice(0, 5);
     const end = (req.body.end_time || s.end_time).slice(0, 5);
     if (end <= start) throw badRequest('Shift end must be after start');
-    const { sets, values } = buildUpdate(req.body, { startIndex: 2 });
-    if (sets.length) await db.query(`UPDATE staff_shifts SET ${sets.join(', ')} WHERE id = $1`, [s.id, ...values]);
-    res.json(await db.one('SELECT * FROM staff_shifts WHERE id = $1', [s.id]));
+    const data = definedOnly(req.body);
+    if (data.start_time) data.start_time = toTime(data.start_time);
+    if (data.end_time) data.end_time = toTime(data.end_time);
+    if (Object.keys(data).length) await db.update('staff_shifts', { id: s.id }, { $set: data });
+    res.json(await db.byId('staff_shifts', s.id));
   })
 );
 
@@ -247,7 +337,7 @@ r.delete(
   requirePerm('staff.manage'),
   ah(async (req, res) => {
     const s = await scopedShift(req);
-    await db.query('DELETE FROM staff_shifts WHERE id = $1', [s.id]);
+    await db.remove('staff_shifts', { id: s.id });
     res.json({ ok: true });
   })
 );
@@ -258,9 +348,9 @@ r.post(
   ah(async (req, res) => {
     const s = await scopedShift(req);
     const now = new Date();
-    const start = new Date(`${s.shift_date}T${s.start_time}`);
+    const start = parseLocal(`${s.shift_date}T${s.start_time}`);
     const late = now.getTime() - start.getTime() > 10 * 60000;
-    res.json(await db.one(`UPDATE staff_shifts SET check_in_at = now(), attendance_status = $2 WHERE id = $1 RETURNING *`, [s.id, late ? 'late' : 'present']));
+    res.json(await db.findOneAndUpdate('staff_shifts', { id: s.id }, { $set: { check_in_at: now, attendance_status: late ? 'late' : 'present' } }));
   })
 );
 
@@ -270,7 +360,7 @@ r.post(
   ah(async (req, res) => {
     const s = await scopedShift(req);
     if (!s.check_in_at) throw badRequest('Check in first');
-    res.json(await db.one(`UPDATE staff_shifts SET check_out_at = now() WHERE id = $1 RETURNING *`, [s.id]));
+    res.json(await db.findOneAndUpdate('staff_shifts', { id: s.id }, { $set: { check_out_at: new Date() } }));
   })
 );
 
@@ -278,22 +368,51 @@ r.get(
   '/attendance/summary',
   requirePerm('staff.manage'),
   ah(async (req, res) => {
-    const from = req.query.from || localDate(new Date(Date.now() - 29 * 86400000));
-    const to = req.query.to || localDate();
-    res.json(
-      await db.many(
-        `SELECT e.id, e.name, e.position,
-                COUNT(s.id) AS shifts,
-                COUNT(s.id) FILTER (WHERE s.attendance_status = 'present') AS present,
-                COUNT(s.id) FILTER (WHERE s.attendance_status = 'late') AS late,
-                COUNT(s.id) FILTER (WHERE s.attendance_status = 'absent') AS absent,
-                COUNT(s.id) FILTER (WHERE s.attendance_status = 'leave') AS leave,
-                ROUND(COALESCE(SUM(EXTRACT(EPOCH FROM (s.check_out_at - s.check_in_at)) / 3600) FILTER (WHERE s.check_out_at IS NOT NULL), 0)::numeric, 1) AS hours
-           FROM employees e LEFT JOIN staff_shifts s ON s.employee_id = e.id AND s.shift_date BETWEEN $2 AND $3
-          WHERE e.branch_id = $1 AND e.status <> 'terminated' GROUP BY e.id ORDER BY e.name`,
-        [req.branchId, from, to]
-      )
-    );
+    const from = String(req.query.from || localDate(new Date(Date.now() - 29 * 86400000)));
+    const to = String(req.query.to || localDate());
+    const emps = await db.find('employees', { branch_id: req.branchId, status: { $ne: 'terminated' } }, { projection: { id: 1, name: 1, position: 1 } });
+    const stats = emps.length
+      ? await db.aggregate('staff_shifts', [
+          { $match: { employee_id: { $in: emps.map((e) => e.id) }, shift_date: { $gte: from, $lte: to } } },
+          {
+            $group: {
+              _id: '$employee_id',
+              shifts: { $sum: 1 },
+              present: { $sum: { $cond: [{ $eq: ['$attendance_status', 'present'] }, 1, 0] } },
+              late: { $sum: { $cond: [{ $eq: ['$attendance_status', 'late'] }, 1, 0] } },
+              absent: { $sum: { $cond: [{ $eq: ['$attendance_status', 'absent'] }, 1, 0] } },
+              leave: { $sum: { $cond: [{ $eq: ['$attendance_status', 'leave'] }, 1, 0] } },
+              hours: {
+                $sum: {
+                  $cond: [
+                    { $and: [{ $gt: ['$check_out_at', null] }, { $gt: ['$check_in_at', null] }] },
+                    { $divide: [{ $subtract: ['$check_out_at', '$check_in_at'] }, 3600000] },
+                    0,
+                  ],
+                },
+              },
+            },
+          },
+        ])
+      : [];
+    const by = new Map(stats.map((s) => [s._id, s]));
+    const rows = emps
+      .map((e) => {
+        const s = by.get(e.id);
+        return {
+          id: e.id,
+          name: e.name,
+          position: e.position,
+          shifts: s?.shifts || 0,
+          present: s?.present || 0,
+          late: s?.late || 0,
+          absent: s?.absent || 0,
+          leave: s?.leave || 0,
+          hours: Math.round((s?.hours || 0) * 10) / 10,
+        };
+      })
+      .sort((a, b) => String(a.name).localeCompare(String(b.name)));
+    res.json(rows);
   })
 );
 
@@ -302,13 +421,21 @@ r.get(
   '/roles',
   requirePerm('staff.manage', 'roles.manage'),
   ah(async (_req, res) => {
-    const roles = await db.many(
-      `SELECT r.id, r.name, r.display_name, r.is_staff,
-              COALESCE((SELECT array_agg(p.code ORDER BY p.code) FROM role_permissions rp JOIN permissions p ON p.id = rp.permission_id WHERE rp.role_id = r.id), '{}') AS permissions
-         FROM roles r WHERE r.is_staff AND r.name <> 'super_admin' ORDER BY r.id`
-    );
-    const permissions = await db.many('SELECT code, module, description FROM permissions ORDER BY module, code');
-    res.json({ roles, permissions });
+    const roleRows = await db.find('roles', { is_staff: true, name: { $ne: 'super_admin' } }, { sort: { id: 1 }, projection: { id: 1, name: 1, display_name: 1, is_staff: 1 } });
+    const links = roleRows.length ? await db.find('role_permissions', { role_id: { $in: roleRows.map((x) => x.id) } }, { projection: { role_id: 1, permission_id: 1 } }) : [];
+    const permissions = await db.find('permissions', {}, { sort: { module: 1, code: 1 }, projection: { id: 1, code: 1, module: 1, description: 1 } });
+    const codeById = new Map(permissions.map((p) => [p.id, p.code]));
+    const roles = roleRows.map((ro) => ({
+      id: ro.id,
+      name: ro.name,
+      display_name: ro.display_name,
+      is_staff: ro.is_staff,
+      permissions: links
+        .filter((l) => l.role_id === ro.id && codeById.has(l.permission_id))
+        .map((l) => codeById.get(l.permission_id))
+        .sort(),
+    }));
+    res.json({ roles, permissions: permissions.map((p) => ({ code: p.code, module: p.module, description: p.description ?? null })) });
   })
 );
 
@@ -317,14 +444,15 @@ r.put(
   requirePerm('roles.manage'),
   validate(z.object({ permissions: z.array(z.string().max(100)).max(100) })),
   ah(async (req, res) => {
-    const role = await db.one('SELECT * FROM roles WHERE id = $1', [pid(req)]);
+    const role = await db.byId('roles', pid(req));
     if (!role || !role.is_staff || role.name === 'super_admin') throw notFound('Role');
     if (req.user.role !== 'super_admin') throw forbidden('Role permissions are shared by all restaurants and can only be changed by a super admin');
     const perms = req.body.permissions.filter((p) => p !== 'roles.manage');
     req.body.permissions = perms;
-    await db.tx(async (t) => {
-      await t.query('DELETE FROM role_permissions WHERE role_id = $1', [role.id]);
-      await t.query(`INSERT INTO role_permissions(role_id, permission_id) SELECT $1, id FROM permissions WHERE code = ANY($2::text[])`, [role.id, req.body.permissions]);
+    await db.tx(async () => {
+      await db.remove('role_permissions', { role_id: role.id });
+      const ids = await db.find('permissions', { code: { $in: req.body.permissions } }, { projection: { id: 1 } });
+      await db.insertMany('role_permissions', ids.map((p) => ({ role_id: role.id, permission_id: p.id })));
     });
     clearAuthCache();
     res.json({ ok: true });
@@ -338,10 +466,21 @@ r.use(
     table: 'suppliers',
     scope: 'restaurant',
     perm: 'inventory.manage',
-    search: ['t.name', 't.contact_person', 't.phone', 't.email'],
-    orderBy: 't.name',
-    select: `t.*, (SELECT COUNT(*) FROM inventory_items i WHERE i.supplier_id = t.id) AS item_count,
-      (SELECT COALESCE(SUM(x.total_cost),0) FROM inventory_transactions x WHERE x.supplier_id = t.id AND x.type = 'stock_in') AS total_purchases`,
+    search: ['name', 'contact_person', 'phone', 'email'],
+    sort: { name: 1 },
+    // computed fields: item_count, total_purchases
+    enrich: async (rows) => {
+      const ids = rows.map((s) => s.id);
+      const [items, purchases] = ids.length
+        ? await Promise.all([
+            db.aggregate('inventory_items', [{ $match: { supplier_id: { $in: ids } } }, { $group: { _id: '$supplier_id', n: { $sum: 1 } } }]),
+            db.aggregate('inventory_transactions', [{ $match: { supplier_id: { $in: ids }, type: 'stock_in' } }, { $group: { _id: '$supplier_id', total: { $sum: '$total_cost' } } }]),
+          ])
+        : [[], []];
+      const itemsBy = new Map(items.map((x) => [x._id, x.n]));
+      const purchBy = new Map(purchases.map((x) => [x._id, x.total]));
+      return rows.map((s) => ({ ...s, item_count: itemsBy.get(s.id) || 0, total_purchases: round2(purchBy.get(s.id) || 0) }));
+    },
     schema: z.object({
       name: zs.str(150).min(2, 'Name is required'),
       contact_person: zs.optStr(120),
@@ -359,10 +498,20 @@ r.get(
   requirePerm('inventory.manage'),
   ah(async (req, res) => {
     const days = parseInt(req.query.days, 10) || 7;
-    const [low, expiring] = await Promise.all([
-      db.many(`SELECT * FROM inventory_items WHERE branch_id = $1 AND is_active AND quantity <= min_quantity ORDER BY (quantity / NULLIF(min_quantity,0)) NULLS FIRST`, [req.branchId]),
-      db.many(`SELECT i.*, (i.expiry_date - CURRENT_DATE) AS days_left FROM inventory_items i WHERE i.branch_id = $1 AND i.is_active AND i.expiry_date IS NOT NULL AND i.expiry_date <= CURRENT_DATE + $2::int ORDER BY i.expiry_date`, [req.branchId, days]),
+    const today = localDate();
+    const [lowRows, expRows] = await Promise.all([
+      db.find('inventory_items', { branch_id: req.branchId, is_active: true, $expr: { $lte: ['$quantity', '$min_quantity'] } }),
+      db.find('inventory_items', { branch_id: req.branchId, is_active: true, expiry_date: { $ne: null, $lte: addDays(today, days) } }, { sort: { expiry_date: 1 } }),
     ]);
+    // ORDER BY quantity / NULLIF(min_quantity, 0) NULLS FIRST
+    const ratio = (i) => (Number(i.min_quantity) === 0 ? null : Number(i.quantity) / Number(i.min_quantity));
+    const low = lowRows.sort((a, b) => {
+      const ra = ratio(a);
+      const rb = ratio(b);
+      if (ra === null || rb === null) return ra === rb ? 0 : ra === null ? -1 : 1;
+      return ra - rb;
+    });
+    const expiring = expRows.map((i) => ({ ...i, days_left: dayDiff(i.expiry_date, today) }));
     res.json({ low, expiring });
   })
 );
@@ -371,32 +520,36 @@ r.get(
   '/inventory/transactions',
   requirePerm('inventory.manage'),
   ah(async (req, res) => {
-    const params = [req.branchId];
-    let extra = '';
+    const items = new Map((await db.find('inventory_items', { branch_id: req.branchId }, { projection: { id: 1, name: 1, unit: 1 } })).map((i) => [i.id, i]));
+    let itemIds = [...items.keys()];
     if (req.query.itemId) {
-      params.push(parseInt(req.query.itemId, 10));
-      extra += ` AND t.inventory_item_id = $${params.length}`;
+      const only = parseInt(req.query.itemId, 10);
+      itemIds = itemIds.filter((id) => id === only);
     }
-    if (req.query.type) {
-      params.push(req.query.type);
-      extra += ` AND t.type = $${params.length}`;
+    const filter = { inventory_item_id: { $in: itemIds } };
+    if (req.query.type) filter.type = req.query.type;
+    if (req.query.from || req.query.to) {
+      filter.created_at = {};
+      if (req.query.from) filter.created_at.$gte = parseLocal(String(req.query.from).slice(0, 10));
+      if (req.query.to) {
+        const end = parseLocal(String(req.query.to).slice(0, 10));
+        end.setDate(end.getDate() + 1);
+        filter.created_at.$lt = end;
+      }
     }
-    if (req.query.from) {
-      params.push(req.query.from);
-      extra += ` AND t.created_at::date >= $${params.length}::date`;
-    }
-    if (req.query.to) {
-      params.push(req.query.to);
-      extra += ` AND t.created_at::date <= $${params.length}::date`;
-    }
+    const rows = itemIds.length ? await db.find('inventory_transactions', filter, { sort: { created_at: -1, id: -1 }, limit: 500 }) : [];
+    const [suppliers, users] = await Promise.all([
+      db.mapByIds('suppliers', rows.map((t) => t.supplier_id), { projection: { name: 1 } }),
+      db.mapByIds('users', rows.map((t) => t.created_by), { projection: { name: 1 } }),
+    ]);
     res.json(
-      await db.many(
-        `SELECT t.*, i.name AS item_name, i.unit, s.name AS supplier_name, u.name AS created_by_name
-           FROM inventory_transactions t JOIN inventory_items i ON i.id = t.inventory_item_id
-           LEFT JOIN suppliers s ON s.id = t.supplier_id LEFT JOIN users u ON u.id = t.created_by
-          WHERE i.branch_id = $1 ${extra} ORDER BY t.created_at DESC LIMIT 500`,
-        params
-      )
+      rows.map((t) => ({
+        ...t,
+        item_name: items.get(t.inventory_item_id).name,
+        unit: items.get(t.inventory_item_id).unit,
+        supplier_name: suppliers.get(t.supplier_id)?.name ?? null,
+        created_by_name: users.get(t.created_by)?.name ?? null,
+      }))
     );
   })
 );
@@ -420,11 +573,13 @@ r.post(
     const b = req.body;
     // "adjustment" sets the physical count (0 allowed); other movements need a positive quantity
     if (b.type !== 'adjustment' && !(b.quantity > 0)) throw badRequest('Quantity must be positive');
-    const result = await db.tx(async (t) => {
-      const item = await t.one('SELECT * FROM inventory_items WHERE id = $1 AND branch_id = $2 FOR UPDATE', [b.inventory_item_id, req.branchId]);
+    const result = await db.tx(async () => {
+      const itemFilter = { id: b.inventory_item_id, branch_id: req.branchId };
+      await db.lock('inventory_items', itemFilter);
+      const item = await db.findOne('inventory_items', itemFilter);
       if (!item) throw notFound('Inventory item');
       if (b.supplier_id) {
-        const s = await t.one('SELECT id FROM suppliers WHERE id = $1 AND restaurant_id = $2', [b.supplier_id, req.restaurantId]);
+        const s = await db.findOne('suppliers', { id: b.supplier_id, restaurant_id: req.restaurantId }, { projection: { id: 1 } });
         if (!s) throw badRequest('Invalid supplier');
       }
       const qty = Number(item.quantity);
@@ -433,19 +588,25 @@ r.post(
       if (balance < 0) throw badRequest(`Insufficient stock. Available: ${qty} ${item.unit}`);
       const delta = b.type === 'adjustment' ? Math.abs(b.quantity - qty) : b.quantity;
       const unitCost = b.unit_cost ?? Number(item.cost_per_unit);
-      const tx = await t.one(
-        `INSERT INTO inventory_transactions(inventory_item_id, type, quantity, unit_cost, total_cost, supplier_id, reference, notes, balance_after, created_by)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING *`,
-        [item.id, b.type, delta, unitCost, round2(delta * unitCost), b.supplier_id || null, b.reference || null, b.notes || null, balance, req.user.id]
-      );
-      await t.query(
-        `UPDATE inventory_items SET quantity = $2,
-            cost_per_unit = CASE WHEN $3 = 'stock_in' AND $4::numeric IS NOT NULL THEN $4::numeric ELSE cost_per_unit END,
-            supplier_id = CASE WHEN $3 = 'stock_in' AND $5::int IS NOT NULL THEN $5::int ELSE supplier_id END,
-            expiry_date = CASE WHEN $3 = 'stock_in' AND $6::date IS NOT NULL THEN $6::date ELSE expiry_date END
-          WHERE id = $1`,
-        [item.id, balance, b.type, b.unit_cost ?? null, b.supplier_id || null, b.expiry_date || null]
-      );
+      const tx = await db.insert('inventory_transactions', {
+        inventory_item_id: item.id,
+        type: b.type,
+        quantity: delta,
+        unit_cost: unitCost,
+        total_cost: round2(delta * unitCost),
+        supplier_id: b.supplier_id || null,
+        reference: b.reference || null,
+        notes: b.notes || null,
+        balance_after: balance,
+        created_by: req.user.id,
+      });
+      const set = { quantity: balance };
+      if (b.type === 'stock_in') {
+        if (b.unit_cost != null) set.cost_per_unit = b.unit_cost;
+        if (b.supplier_id) set.supplier_id = b.supplier_id;
+        if (b.expiry_date) set.expiry_date = b.expiry_date;
+      }
+      await db.update('inventory_items', { id: item.id }, { $set: set });
       return { tx, item, balance };
     });
     const { item, balance } = result;
@@ -471,13 +632,20 @@ r.use(
     table: 'inventory_items',
     scope: 'branch',
     perm: 'inventory.manage',
-    search: ['t.name', 't.sku', 't.category'],
-    filters: { category: 't.category', supplierId: 't.supplier_id' },
-    orderBy: 't.name',
-    select: `t.*, t.expiry_date::text AS expiry_date, s.name AS supplier_name,
-      CASE WHEN t.quantity <= t.min_quantity THEN 'low' WHEN t.expiry_date IS NOT NULL AND t.expiry_date <= CURRENT_DATE + 7 THEN 'expiring' ELSE 'ok' END AS stock_status`,
-    from: 'inventory_items t LEFT JOIN suppliers s ON s.id = t.supplier_id',
+    search: ['name', 'sku', 'category'],
+    filters: { category: 'category', supplierId: 'supplier_id' },
+    sort: { name: 1 },
     refs: { supplier_id: ['suppliers', 'restaurant'] },
+    // joined/computed fields: supplier_name, stock_status
+    enrich: async (rows) => {
+      const suppliers = await db.mapByIds('suppliers', rows.map((i) => i.supplier_id), { projection: { name: 1 } });
+      const soon = addDays(localDate(), 7);
+      return rows.map((i) => ({
+        ...i,
+        supplier_name: suppliers.get(i.supplier_id)?.name ?? null,
+        stock_status: Number(i.quantity) <= Number(i.min_quantity) ? 'low' : i.expiry_date && i.expiry_date <= soon ? 'expiring' : 'ok',
+      }));
+    },
     schema: z.object({
       name: zs.str(150).min(2, 'Name is required'),
       sku: zs.optStr(50),

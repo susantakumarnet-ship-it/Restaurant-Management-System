@@ -12,13 +12,13 @@
     "seed": "node src/db/seed.js",
     "db:reset": "node src/db/seed.js --reset",
     "db:backup": "node scripts/backup.js",
-    "sql": "node scripts/sql.js",
+    "db:restore": "node scripts/backup.js --restore",
+    "query": "node scripts/query.js",
     "test": "vitest run",
     "test:watch": "vitest"
   },
   "license": "UNLICENSED",
   "dependencies": {
-    "@electric-sql/pglite": "^0.5.15",
     "bcryptjs": "^3.0.3",
     "cors": "^2.8.6",
     "dotenv": "^18.0.9",
@@ -27,15 +27,16 @@
     "express-rate-limit": "^8.7.3",
     "helmet": "^8.3.0",
     "jsonwebtoken": "^9.0.3",
+    "mongodb": "^6.22.0",
     "morgan": "^1.12.1",
     "multer": "^2.5.0",
     "nodemailer": "^10.3.1",
     "pdfkit": "^0.20.2",
-    "pg": "^8.23.1",
     "razorpay": "^2.9.8",
     "zod": "^3.25.76"
   },
   "devDependencies": {
+    "mongodb-memory-server": "^10.4.3",
     "supertest": "^7.3.1",
     "vitest": "^5.1.0"
   }

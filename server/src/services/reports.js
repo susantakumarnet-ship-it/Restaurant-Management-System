@@ -1,10 +1,32 @@
 import ExcelJS from 'exceljs';
-import { db } from '../db/index.js';
+import { db, TIMEZONE } from '../db/index.js';
 import { badRequest } from '../utils/http.js';
-import { round2 } from '../utils/common.js';
+import { localDate, localIso, parseLocal, round2 } from '../utils/common.js';
 import { tablePdf } from './pdf.js';
 
 const sum = (rows, k) => round2(rows.reduce((s, r) => s + Number(r[k] || 0), 0));
+
+// ---- date helpers (restaurant-local days, like PostgreSQL `ts::date` in the session time zone) ----
+const nextDay = (s) => {
+  const d = parseLocal(s);
+  d.setDate(d.getDate() + 1);
+  return d;
+};
+/** TIMESTAMPTZ filter equivalent to `col::date BETWEEN from AND to`. */
+const dateRange = (from, to) => ({ $gte: parseLocal(from), $lt: nextDay(to) });
+const localDay = (field) => ({ $dateToString: { format: '%Y-%m-%d', date: field, timezone: TIMEZONE } });
+/** 'YYYY-MM-DD' + n days (pure calendar arithmetic). */
+const addDays = (s, n) => {
+  const d = new Date(`${s}T00:00:00Z`);
+  d.setUTCDate(d.getUTCDate() + n);
+  return d.toISOString().slice(0, 10);
+};
+/** to_char(ts, 'YYYY-MM-DD HH24:MI') in local time. */
+const localMinute = (d) => (d ? localIso(new Date(d)).slice(0, 16).replace('T', ' ') : null);
+const roundKeys = (row, keys) => {
+  for (const k of keys) row[k] = round2(row[k] || 0);
+  return row;
+};
 
 /**
  * Report definitions. Each returns { title, columns, rows, summary }.
@@ -14,15 +36,27 @@ const REPORTS = {
   sales_daily: {
     title: 'Daily Sales Report',
     async run({ branchIds, from, to }) {
-      const rows = await db.many(
-        `SELECT to_char(o.created_at::date, 'YYYY-MM-DD') AS day, COUNT(*) AS orders,
-                SUM(o.subtotal) AS gross, SUM(o.discount) AS discount, SUM(o.tax) AS tax,
-                SUM(o.service_charge + o.delivery_charge) AS charges, SUM(o.total) AS net,
-                SUM(o.amount_paid) AS collected
-           FROM orders o
-          WHERE o.branch_id = ANY($1::int[]) AND o.status <> 'cancelled' AND o.created_at::date BETWEEN $2 AND $3
-          GROUP BY 1 ORDER BY 1`,
-        [branchIds, from, to]
+      const grouped = await db.aggregate('orders', [
+        { $match: { branch_id: { $in: branchIds }, status: { $ne: 'cancelled' }, created_at: dateRange(from, to) } },
+        {
+          $group: {
+            _id: localDay('$created_at'),
+            orders: { $sum: 1 },
+            gross: { $sum: '$subtotal' },
+            discount: { $sum: '$discount' },
+            tax: { $sum: '$tax' },
+            charges: { $sum: { $add: ['$service_charge', '$delivery_charge'] } },
+            net: { $sum: '$total' },
+            collected: { $sum: '$amount_paid' },
+          },
+        },
+        { $sort: { _id: 1 } },
+      ]);
+      const rows = grouped.map((g) =>
+        roundKeys(
+          { day: g._id, orders: g.orders, gross: g.gross, discount: g.discount, tax: g.tax, charges: g.charges, net: g.net, collected: g.collected },
+          ['gross', 'discount', 'tax', 'charges', 'net', 'collected']
+        )
       );
       return {
         columns: [
@@ -44,16 +78,27 @@ const REPORTS = {
     title: 'Revenue Report (Weekly / Monthly)',
     async run({ branchIds, from, to, period = 'month' }) {
       const unit = period === 'week' ? 'week' : 'month';
-      const rows = await db.many(
-        `SELECT to_char(date_trunc('${unit}', p.created_at), '${unit === 'week' ? 'IYYY-"W"IW' : 'YYYY-MM'}') AS period,
-                COUNT(*) FILTER (WHERE p.purpose = 'order') AS order_payments,
-                COUNT(*) FILTER (WHERE p.purpose = 'advance') AS advance_payments,
-                SUM(p.amount) AS received, SUM(p.refunded_amount) AS refunded, SUM(p.amount - p.refunded_amount) AS net
-           FROM payments p
-          WHERE p.branch_id = ANY($1::int[]) AND p.status IN ('success','refunded','partially_refunded')
-            AND p.created_at::date BETWEEN $2 AND $3
-          GROUP BY date_trunc('${unit}', p.created_at) ORDER BY date_trunc('${unit}', p.created_at)`,
-        [branchIds, from, to]
+      // ISO week (IYYY-"W"IW) or calendar month; both formats sort chronologically as strings.
+      const format = unit === 'week' ? '%G-W%V' : '%Y-%m';
+      const grouped = await db.aggregate('payments', [
+        { $match: { branch_id: { $in: branchIds }, status: { $in: ['success', 'refunded', 'partially_refunded'] }, created_at: dateRange(from, to) } },
+        {
+          $group: {
+            _id: { $dateToString: { format, date: '$created_at', timezone: TIMEZONE } },
+            order_payments: { $sum: { $cond: [{ $eq: ['$purpose', 'order'] }, 1, 0] } },
+            advance_payments: { $sum: { $cond: [{ $eq: ['$purpose', 'advance'] }, 1, 0] } },
+            received: { $sum: '$amount' },
+            refunded: { $sum: '$refunded_amount' },
+            net: { $sum: { $subtract: ['$amount', '$refunded_amount'] } },
+          },
+        },
+        { $sort: { _id: 1 } },
+      ]);
+      const rows = grouped.map((g) =>
+        roundKeys(
+          { period: g._id, order_payments: g.order_payments, advance_payments: g.advance_payments, received: g.received, refunded: g.refunded, net: g.net },
+          ['received', 'refunded', 'net']
+        )
       );
       return {
         columns: [
@@ -69,16 +114,32 @@ const REPORTS = {
   bookings: {
     title: 'Booking Report',
     async run({ branchIds, from, to, status }) {
-      const rows = await db.many(
-        `SELECT r.booking_code, r.booking_date::text AS date, to_char(r.start_at, 'HH24:MI') AS time, r.customer_name, r.phone,
-                r.guests, r.status, r.source, r.occasion,
-                COALESCE((SELECT string_agg(t.table_number, ', ') FROM reservation_tables rt JOIN tables t ON t.id = rt.table_id WHERE rt.reservation_id = r.id), '') AS tables,
-                r.advance_amount, r.payment_status
-           FROM reservations r
-          WHERE r.branch_id = ANY($1::int[]) AND r.booking_date BETWEEN $2 AND $3 AND ($4::text IS NULL OR r.status = $4)
-          ORDER BY r.start_at`,
-        [branchIds, from, to, status || null]
-      );
+      const filter = { branch_id: { $in: branchIds }, booking_date: { $gte: from, $lte: to } };
+      if (status) filter.status = status;
+      const resv = await db.find('reservations', filter, { sort: { start_at: 1 } });
+      const links = resv.length ? await db.find('reservation_tables', { reservation_id: { $in: resv.map((x) => x.id) } }, { projection: { reservation_id: 1, table_id: 1 } }) : [];
+      const tables = await db.mapByIds('tables', links.map((l) => l.table_id), { projection: { table_number: 1 } });
+      const tablesBy = new Map();
+      for (const l of links) {
+        const t = tables.get(l.table_id);
+        if (!t) continue;
+        if (!tablesBy.has(l.reservation_id)) tablesBy.set(l.reservation_id, []);
+        tablesBy.get(l.reservation_id).push(t.table_number);
+      }
+      const rows = resv.map((r) => ({
+        booking_code: r.booking_code,
+        date: r.booking_date,
+        time: r.start_at ? String(r.start_at).slice(11, 16) : null,
+        customer_name: r.customer_name,
+        phone: r.phone,
+        guests: r.guests,
+        status: r.status,
+        source: r.source,
+        occasion: r.occasion,
+        tables: (tablesBy.get(r.id) || []).join(', '),
+        advance_amount: r.advance_amount,
+        payment_status: r.payment_status,
+      }));
       const by = (s) => rows.filter((r) => r.status === s).length;
       return {
         columns: [
@@ -98,15 +159,23 @@ const REPORTS = {
   cancelled_bookings: {
     title: 'Cancelled & Rejected Bookings',
     async run({ branchIds, from, to }) {
-      const rows = await db.many(
-        `SELECT r.booking_code, r.booking_date::text AS date, to_char(r.start_at, 'HH24:MI') AS time, r.customer_name, r.phone, r.guests,
-                r.status, COALESCE(r.cancel_reason, r.admin_notes, '') AS reason,
-                to_char(r.cancelled_at, 'YYYY-MM-DD HH24:MI') AS cancelled_at, r.payment_status
-           FROM reservations r
-          WHERE r.branch_id = ANY($1::int[]) AND r.status IN ('cancelled','rejected','no_show') AND r.booking_date BETWEEN $2 AND $3
-          ORDER BY r.booking_date DESC`,
-        [branchIds, from, to]
+      const resv = await db.find(
+        'reservations',
+        { branch_id: { $in: branchIds }, status: { $in: ['cancelled', 'rejected', 'no_show'] }, booking_date: { $gte: from, $lte: to } },
+        { sort: { booking_date: -1 } }
       );
+      const rows = resv.map((r) => ({
+        booking_code: r.booking_code,
+        date: r.booking_date,
+        time: r.start_at ? String(r.start_at).slice(11, 16) : null,
+        customer_name: r.customer_name,
+        phone: r.phone,
+        guests: r.guests,
+        status: r.status,
+        reason: r.cancel_reason ?? r.admin_notes ?? '',
+        cancelled_at: localMinute(r.cancelled_at),
+        payment_status: r.payment_status,
+      }));
       return {
         columns: [
           { key: 'booking_code', label: 'Booking ID' }, { key: 'date', label: 'Date' }, { key: 'time', label: 'Time' },
@@ -121,18 +190,41 @@ const REPORTS = {
   customers: {
     title: 'Customer Report',
     async run({ branchIds, from, to }) {
-      const rows = await db.many(
-        `SELECT u.name, u.email, u.phone, c.loyalty_points, c.status,
-                (SELECT COUNT(*) FROM reservations r WHERE r.customer_id = c.id AND r.branch_id = ANY($1::int[]) AND r.booking_date BETWEEN $2 AND $3) AS bookings,
-                (SELECT COUNT(*) FROM orders o WHERE o.customer_id = c.id AND o.branch_id = ANY($1::int[]) AND o.status <> 'cancelled' AND o.created_at::date BETWEEN $2 AND $3) AS orders,
-                (SELECT COALESCE(SUM(o.total),0) FROM orders o WHERE o.customer_id = c.id AND o.branch_id = ANY($1::int[]) AND o.status <> 'cancelled' AND o.created_at::date BETWEEN $2 AND $3) AS spent,
-                to_char(c.created_at, 'YYYY-MM-DD') AS joined
-           FROM customers c JOIN users u ON u.id = c.user_id
-          WHERE EXISTS (SELECT 1 FROM reservations r WHERE r.customer_id = c.id AND r.branch_id = ANY($1::int[]))
-             OR EXISTS (SELECT 1 FROM orders o WHERE o.customer_id = c.id AND o.branch_id = ANY($1::int[]))
-          ORDER BY spent DESC`,
-        [branchIds, from, to]
-      );
+      const scope = { branch_id: { $in: branchIds }, customer_id: { $ne: null } };
+      const [rc, oc] = await Promise.all([db.distinct('reservations', 'customer_id', scope), db.distinct('orders', 'customer_id', scope)]);
+      const ids = [...new Set([...rc, ...oc])];
+      const customers = ids.length ? await db.find('customers', { id: { $in: ids } }) : [];
+      const [users, bk, od] = await Promise.all([
+        db.mapByIds('users', customers.map((c) => c.user_id), { projection: { name: 1, email: 1, phone: 1 } }),
+        db.aggregate('reservations', [
+          { $match: { customer_id: { $in: ids }, branch_id: { $in: branchIds }, booking_date: { $gte: from, $lte: to } } },
+          { $group: { _id: '$customer_id', n: { $sum: 1 } } },
+        ]),
+        db.aggregate('orders', [
+          { $match: { customer_id: { $in: ids }, branch_id: { $in: branchIds }, status: { $ne: 'cancelled' }, created_at: dateRange(from, to) } },
+          { $group: { _id: '$customer_id', n: { $sum: 1 }, spent: { $sum: '$total' } } },
+        ]),
+      ]);
+      const bookingsBy = new Map(bk.map((x) => [x._id, x.n]));
+      const ordersBy = new Map(od.map((x) => [x._id, x]));
+      const rows = customers
+        .filter((c) => users.has(c.user_id))
+        .map((c) => {
+          const u = users.get(c.user_id);
+          const o = ordersBy.get(c.id);
+          return {
+            name: u.name,
+            email: u.email,
+            phone: u.phone ?? null,
+            loyalty_points: c.loyalty_points,
+            status: c.status,
+            bookings: bookingsBy.get(c.id) || 0,
+            orders: o?.n || 0,
+            spent: round2(o?.spent || 0),
+            joined: c.created_at ? localDate(new Date(c.created_at)) : null,
+          };
+        })
+        .sort((a, b) => b.spent - a.spent);
       return {
         columns: [
           { key: 'name', label: 'Name' }, { key: 'email', label: 'Email' }, { key: 'phone', label: 'Phone' },
@@ -147,15 +239,36 @@ const REPORTS = {
   food_sales: {
     title: 'Food Sales Report',
     async run({ branchIds, from, to }) {
-      const rows = await db.many(
-        `SELECT oi.name AS item, COALESCE(fc.name, '-') AS category, SUM(oi.quantity) AS quantity, SUM(oi.line_total) AS revenue,
-                COUNT(DISTINCT oi.order_id) AS orders
-           FROM order_items oi JOIN orders o ON o.id = oi.order_id
-           LEFT JOIN food_items fi ON fi.id = oi.food_item_id LEFT JOIN food_categories fc ON fc.id = fi.category_id
-          WHERE o.branch_id = ANY($1::int[]) AND o.status <> 'cancelled' AND o.created_at::date BETWEEN $2 AND $3
-          GROUP BY oi.name, fc.name ORDER BY revenue DESC`,
-        [branchIds, from, to]
-      );
+      // Group by (item name, food item) in MongoDB, then fold food items into their category name.
+      const grouped = await db.aggregate('orders', [
+        { $match: { branch_id: { $in: branchIds }, status: { $ne: 'cancelled' }, created_at: dateRange(from, to) } },
+        { $project: { _id: 0, id: 1 } },
+        { $lookup: { from: 'order_items', localField: 'id', foreignField: 'order_id', as: 'oi' } },
+        { $unwind: '$oi' },
+        {
+          $group: {
+            _id: { name: '$oi.name', food_item_id: '$oi.food_item_id' },
+            quantity: { $sum: '$oi.quantity' },
+            revenue: { $sum: '$oi.line_total' },
+            orders: { $addToSet: '$oi.order_id' },
+          },
+        },
+      ]);
+      const foods = await db.mapByIds('food_items', grouped.map((g) => g._id.food_item_id), { projection: { category_id: 1 } });
+      const cats = await db.mapByIds('food_categories', [...foods.values()].map((f) => f.category_id), { projection: { name: 1 } });
+      const acc = new Map();
+      for (const g of grouped) {
+        const catName = cats.get(foods.get(g._id.food_item_id)?.category_id)?.name ?? null;
+        const key = JSON.stringify([g._id.name, catName]);
+        if (!acc.has(key)) acc.set(key, { item: g._id.name, category: catName ?? '-', quantity: 0, revenue: 0, orders: new Set() });
+        const a = acc.get(key);
+        a.quantity += Number(g.quantity || 0);
+        a.revenue += Number(g.revenue || 0);
+        for (const id of g.orders) a.orders.add(id);
+      }
+      const rows = [...acc.values()]
+        .map((a) => ({ item: a.item, category: a.category, quantity: round2(a.quantity), revenue: round2(a.revenue), orders: a.orders.size }))
+        .sort((a, b) => b.revenue - a.revenue);
       return {
         columns: [
           { key: 'item', label: 'Item' }, { key: 'category', label: 'Category' }, { key: 'quantity', label: 'Qty Sold' },
@@ -169,14 +282,23 @@ const REPORTS = {
   payments: {
     title: 'Payment Report',
     async run({ branchIds, from, to }) {
-      const rows = await db.many(
-        `SELECT p.payment_code, to_char(p.created_at, 'YYYY-MM-DD HH24:MI') AS date, p.method, p.purpose, p.status,
-                COALESCE(o.order_code, r.booking_code) AS reference, p.amount, p.refunded_amount, p.gateway, COALESCE(p.gateway_payment_id,'') AS gateway_ref
-           FROM payments p LEFT JOIN orders o ON o.id = p.order_id LEFT JOIN reservations r ON r.id = p.reservation_id
-          WHERE p.branch_id = ANY($1::int[]) AND p.created_at::date BETWEEN $2 AND $3
-          ORDER BY p.created_at DESC`,
-        [branchIds, from, to]
-      );
+      const pays = await db.find('payments', { branch_id: { $in: branchIds }, created_at: dateRange(from, to) }, { sort: { created_at: -1 } });
+      const [orders, resv] = await Promise.all([
+        db.mapByIds('orders', pays.map((p) => p.order_id), { projection: { order_code: 1 } }),
+        db.mapByIds('reservations', pays.map((p) => p.reservation_id), { projection: { booking_code: 1 } }),
+      ]);
+      const rows = pays.map((p) => ({
+        payment_code: p.payment_code,
+        date: localMinute(p.created_at),
+        method: p.method,
+        purpose: p.purpose,
+        status: p.status,
+        reference: orders.get(p.order_id)?.order_code ?? resv.get(p.reservation_id)?.booking_code ?? null,
+        amount: p.amount,
+        refunded_amount: p.refunded_amount,
+        gateway: p.gateway ?? null,
+        gateway_ref: p.gateway_payment_id ?? '',
+      }));
       const ok = rows.filter((r) => ['success', 'refunded', 'partially_refunded'].includes(r.status));
       const byMethod = ['cash', 'upi', 'card', 'online'].map((m) => ({ label: m.toUpperCase(), value: sum(ok.filter((r) => r.method === m), 'amount'), type: 'money' }));
       return {
@@ -194,14 +316,26 @@ const REPORTS = {
   gst: {
     title: 'GST Report',
     async run({ branchIds, from, to }) {
-      const rows = await db.many(
-        `SELECT to_char(i.issued_at::date, 'YYYY-MM-DD') AS day, COUNT(*) AS invoices,
-                SUM(i.subtotal - i.discount + i.service_charge) AS taxable, SUM(i.cgst) AS cgst, SUM(i.sgst) AS sgst,
-                SUM(i.cgst + i.sgst) AS total_tax, SUM(i.total) AS invoice_value
-           FROM invoices i
-          WHERE i.branch_id = ANY($1::int[]) AND i.issued_at::date BETWEEN $2 AND $3
-          GROUP BY 1 ORDER BY 1`,
-        [branchIds, from, to]
+      const grouped = await db.aggregate('invoices', [
+        { $match: { branch_id: { $in: branchIds }, issued_at: dateRange(from, to) } },
+        {
+          $group: {
+            _id: localDay('$issued_at'),
+            invoices: { $sum: 1 },
+            taxable: { $sum: { $add: [{ $subtract: ['$subtotal', '$discount'] }, '$service_charge'] } },
+            cgst: { $sum: '$cgst' },
+            sgst: { $sum: '$sgst' },
+            total_tax: { $sum: { $add: ['$cgst', '$sgst'] } },
+            invoice_value: { $sum: '$total' },
+          },
+        },
+        { $sort: { _id: 1 } },
+      ]);
+      const rows = grouped.map((g) =>
+        roundKeys(
+          { day: g._id, invoices: g.invoices, taxable: g.taxable, cgst: g.cgst, sgst: g.sgst, total_tax: g.total_tax, invoice_value: g.invoice_value },
+          ['taxable', 'cgst', 'sgst', 'total_tax', 'invoice_value']
+        )
       );
       return {
         columns: [
@@ -220,18 +354,45 @@ const REPORTS = {
   inventory: {
     title: 'Inventory Report',
     async run({ branchIds, from, to }) {
-      const rows = await db.many(
-        `SELECT i.name, COALESCE(i.category,'') AS category, i.unit, i.quantity, i.min_quantity, i.cost_per_unit,
-                round(i.quantity * i.cost_per_unit, 2) AS stock_value, COALESCE(s.name,'') AS supplier,
-                COALESCE(i.expiry_date::text,'') AS expiry_date,
-                COALESCE((SELECT SUM(t.quantity) FROM inventory_transactions t WHERE t.inventory_item_id = i.id AND t.type = 'stock_in' AND t.created_at::date BETWEEN $2 AND $3),0) AS stock_in,
-                COALESCE((SELECT SUM(t.quantity) FROM inventory_transactions t WHERE t.inventory_item_id = i.id AND t.type IN ('stock_out','wastage') AND t.created_at::date BETWEEN $2 AND $3),0) AS used,
-                CASE WHEN i.quantity <= i.min_quantity THEN 'LOW' WHEN i.expiry_date IS NOT NULL AND i.expiry_date <= CURRENT_DATE + 7 THEN 'EXPIRING' ELSE 'OK' END AS stock_status
-           FROM inventory_items i LEFT JOIN suppliers s ON s.id = i.supplier_id
-          WHERE i.branch_id = ANY($1::int[]) AND i.is_active
-          ORDER BY stock_status, i.name`,
-        [branchIds, from, to]
-      );
+      const items = await db.find('inventory_items', { branch_id: { $in: branchIds }, is_active: true });
+      const [suppliers, moves] = await Promise.all([
+        db.mapByIds('suppliers', items.map((i) => i.supplier_id), { projection: { name: 1 } }),
+        items.length
+          ? db.aggregate('inventory_transactions', [
+              { $match: { inventory_item_id: { $in: items.map((i) => i.id) }, type: { $in: ['stock_in', 'stock_out', 'wastage'] }, created_at: dateRange(from, to) } },
+              {
+                $group: {
+                  _id: '$inventory_item_id',
+                  stock_in: { $sum: { $cond: [{ $eq: ['$type', 'stock_in'] }, '$quantity', 0] } },
+                  used: { $sum: { $cond: [{ $in: ['$type', ['stock_out', 'wastage']] }, '$quantity', 0] } },
+                },
+              },
+            ])
+          : [],
+      ]);
+      const movesBy = new Map(moves.map((m) => [m._id, m]));
+      const soon = addDays(localDate(), 7);
+      const rows = items
+        .map((i) => {
+          const q = Number(i.quantity || 0);
+          const min = Number(i.min_quantity || 0);
+          const m = movesBy.get(i.id);
+          return {
+            name: i.name,
+            category: i.category ?? '',
+            unit: i.unit,
+            quantity: i.quantity,
+            min_quantity: i.min_quantity,
+            cost_per_unit: i.cost_per_unit,
+            stock_value: round2(q * Number(i.cost_per_unit || 0)),
+            supplier: suppliers.get(i.supplier_id)?.name ?? '',
+            expiry_date: i.expiry_date ?? '',
+            stock_in: round2(m?.stock_in || 0),
+            used: round2(m?.used || 0),
+            stock_status: q <= min ? 'LOW' : i.expiry_date && i.expiry_date <= soon ? 'EXPIRING' : 'OK',
+          };
+        })
+        .sort((a, b) => (a.stock_status === b.stock_status ? String(a.name).localeCompare(String(b.name)) : a.stock_status < b.stock_status ? -1 : 1));
       return {
         columns: [
           { key: 'name', label: 'Item' }, { key: 'category', label: 'Category' }, { key: 'quantity', label: 'In Stock' },

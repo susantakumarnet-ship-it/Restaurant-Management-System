@@ -1,6 +1,6 @@
 import { Router } from 'express';
 import { z } from 'zod';
-import { db } from '../../db/index.js';
+import { db, escapeRegex } from '../../db/index.js';
 import { ah, badRequest, notFound, validate } from '../../utils/http.js';
 import { requirePerm } from '../../middleware/auth.js';
 import { assignTables, changeStatus, createReservation, getAvailability, getReservation, modifyReservation, RES_STATUSES } from '../../services/booking.js';
@@ -8,7 +8,7 @@ import { changeOrderStatus, createOrder, getOrder, ORDER_STATUSES } from '../../
 import { bookingPdf } from '../../services/pdf.js';
 import { notify } from '../../services/notify.js';
 import { zs } from './crud.js';
-import { localDate } from '../../utils/common.js';
+import { ilike, localDate, localIso, parseLocal } from '../../utils/common.js';
 
 const r = Router();
 const pid = (req) => parseInt(req.params.id, 10) || 0;
@@ -25,39 +25,60 @@ r.get(
   requirePerm('reservations.view', 'reservations.manage'),
   ah(async (req, res) => {
     const q = req.query;
-    const params = [req.branchId];
-    const where = ['r.branch_id = $1'];
-    const add = (sql, v) => {
-      params.push(v);
-      where.push(sql.replace('?', `$${params.length}`));
-    };
-    if (q.q) add(`(r.booking_code ILIKE ? OR r.customer_name ILIKE ? OR r.phone ILIKE ? OR r.email ILIKE ?)`.replace(/\?/g, `$${params.length + 1}`), `%${String(q.q).trim()}%`);
-    if (q.status && RES_STATUSES.includes(q.status)) add('r.status = ?', q.status);
-    if (q.date) add('r.booking_date = ?::date', q.date);
-    if (q.from) add('r.booking_date >= ?::date', q.from);
-    if (q.to) add('r.booking_date <= ?::date', q.to);
-    if (q.time) add(`to_char(r.start_at, 'HH24:MI') = ?`, q.time);
-    if (q.tableId) add('EXISTS (SELECT 1 FROM reservation_tables x WHERE x.reservation_id = r.id AND x.table_id = ?::int)', q.tableId);
-    if (q.sectionId) add('r.section_id = ?::int', q.sectionId);
+    const and = [{ branch_id: req.branchId }];
+    if (q.q) {
+      const rx = ilike(q.q);
+      and.push({ $or: [{ booking_code: rx }, { customer_name: rx }, { phone: rx }, { email: rx }] });
+    }
+    if (q.status && RES_STATUSES.includes(q.status)) and.push({ status: q.status });
+    if (q.date) and.push({ booking_date: String(q.date) });
+    if (q.from) and.push({ booking_date: { $gte: String(q.from) } });
+    if (q.to) and.push({ booking_date: { $lte: String(q.to) } });
+    if (q.time) and.push({ start_at: { $regex: `^\\d{4}-\\d{2}-\\d{2}T${escapeRegex(q.time)}:` } });
+    if (q.tableId) and.push({ id: { $in: await db.distinct('reservation_tables', 'reservation_id', { table_id: toInt(q.tableId) }) } });
+    if (q.sectionId) and.push({ section_id: toInt(q.sectionId) });
     // 'upcoming': future bookings first (soonest at top), then past ones newest-first
-    const sort =
-      q.sort === 'created'
-        ? 'r.created_at DESC'
-        : q.sort === 'upcoming'
-          ? `(r.end_at < LOCALTIMESTAMP), CASE WHEN r.end_at >= LOCALTIMESTAMP THEN r.start_at END ASC, r.start_at DESC`
-          : 'r.start_at DESC';
-    res.json(
-      await db.many(
-        `SELECT r.*, s.name AS section_name,
-                COALESCE((SELECT json_agg(json_build_object('id', t.id, 'table_number', t.table_number, 'capacity', t.capacity) ORDER BY t.table_number)
-                  FROM reservation_tables rt JOIN tables t ON t.id = rt.table_id WHERE rt.reservation_id = r.id), '[]'::json) AS tables
-           FROM reservations r LEFT JOIN table_sections s ON s.id = r.section_id
-          WHERE ${where.join(' AND ')} ORDER BY ${sort} LIMIT 500`,
-        params
-      )
-    );
+    const nowTs = localIso();
+    const pipeline = [{ $match: and.length > 1 ? { $and: and } : and[0] }];
+    if (q.sort === 'created') pipeline.push({ $sort: { created_at: -1 } });
+    else if (q.sort === 'upcoming') {
+      pipeline.push(
+        { $addFields: { _past: { $lt: ['$end_at', nowTs] } } },
+        { $addFields: { _upStart: { $cond: ['$_past', null, '$start_at'] } } },
+        { $sort: { _past: 1, _upStart: 1, start_at: -1 } }
+      );
+    } else pipeline.push({ $sort: { start_at: -1 } });
+    pipeline.push({ $limit: 500 }, { $project: { _id: 0, _lock: 0, _past: 0, _upStart: 0 } });
+    const rows = await db.aggregate('reservations', pipeline);
+    res.json(await withSectionAndTables(rows));
   })
 );
+
+const toInt = (v) => (/^-?\d+$/.test(String(v).trim()) ? parseInt(v, 10) : NaN);
+const collator = new Intl.Collator('en');
+
+/** Adds section_name and tables [{id, table_number, capacity}] (ordered by table_number) to reservations. */
+async function withSectionAndTables(rows) {
+  if (!rows.length) return rows;
+  const ids = rows.map((x) => x.id);
+  const [sections, links] = await Promise.all([
+    db.mapByIds('table_sections', rows.map((x) => x.section_id), { projection: { name: 1 } }),
+    db.find('reservation_tables', { reservation_id: { $in: ids } }, { projection: { reservation_id: 1, table_id: 1 } }),
+  ]);
+  const tables = await db.mapByIds('tables', links.map((l) => l.table_id), { projection: { table_number: 1, capacity: 1 } });
+  const byRes = new Map();
+  for (const l of links) {
+    const t = tables.get(l.table_id);
+    if (!t) continue;
+    if (!byRes.has(l.reservation_id)) byRes.set(l.reservation_id, []);
+    byRes.get(l.reservation_id).push({ id: t.id, table_number: t.table_number, capacity: t.capacity });
+  }
+  return rows.map((x) => ({
+    ...x,
+    section_name: sections.get(x.section_id)?.name ?? null,
+    tables: (byRes.get(x.id) || []).sort((a, b) => collator.compare(a.table_number, b.table_number)),
+  }));
+}
 
 /** Month calendar: counts per day & status. */
 r.get(
@@ -65,12 +86,12 @@ r.get(
   requirePerm('reservations.view', 'reservations.manage'),
   ah(async (req, res) => {
     const month = /^\d{4}-\d{2}$/.test(req.query.month || '') ? req.query.month : localDate().slice(0, 7);
-    const rows = await db.many(
-      `SELECT booking_date::text AS date, status, COUNT(*) AS count, SUM(guests) AS guests
-         FROM reservations WHERE branch_id = $1 AND to_char(booking_date, 'YYYY-MM') = $2
-        GROUP BY booking_date, status ORDER BY booking_date`,
-      [req.branchId, month]
-    );
+    const rows = await db.aggregate('reservations', [
+      { $match: { branch_id: req.branchId, booking_date: { $regex: `^${month}-` } } },
+      { $group: { _id: { date: '$booking_date', status: '$status' }, count: { $sum: 1 }, guests: { $sum: { $ifNull: ['$guests', 0] } } } },
+      { $sort: { '_id.date': 1 } },
+      { $project: { _id: 0, date: '$_id.date', status: '$_id.status', count: 1, guests: 1 } },
+    ]);
     const days = {};
     for (const row of rows) {
       days[row.date] ||= { date: row.date, total: 0, guests: 0, byStatus: {} };
@@ -106,20 +127,16 @@ r.get(
   requirePerm('reservations.view', 'reservations.manage'),
   ah(async (req, res) => {
     const resv = await scopedReservation(req);
-    const history = await db.many(
-      `SELECT h.*, u.name AS changed_by_name FROM reservation_status_history h LEFT JOIN users u ON u.id = h.changed_by
-        WHERE h.reservation_id = $1 ORDER BY h.id`,
-      [resv.id]
-    );
-    const payments = await db.many('SELECT * FROM payments WHERE reservation_id = $1 ORDER BY id', [resv.id]);
-    const orders = await db.many('SELECT id, order_code, total, status, payment_status FROM orders WHERE reservation_id = $1', [resv.id]);
-    const customer = resv.customer_id
-      ? await db.one(
-          `SELECT c.loyalty_points, c.total_spent, (SELECT COUNT(*) FROM reservations x WHERE x.customer_id = c.id) AS visits
-             FROM customers c WHERE c.id = $1`,
-          [resv.customer_id]
-        )
-      : null;
+    const hist = await db.find('reservation_status_history', { reservation_id: resv.id }, { sort: { id: 1 } });
+    const users = await db.mapByIds('users', hist.map((h) => h.changed_by), { projection: { name: 1 } });
+    const history = hist.map((h) => ({ ...h, changed_by_name: users.get(h.changed_by)?.name ?? null }));
+    const payments = await db.find('payments', { reservation_id: resv.id }, { sort: { id: 1 } });
+    const orders = await db.find('orders', { reservation_id: resv.id }, { sort: { id: 1 }, projection: { id: 1, order_code: 1, total: 1, status: 1, payment_status: 1 } });
+    let customer = null;
+    if (resv.customer_id) {
+      const c = await db.byId('customers', resv.customer_id, { projection: { loyalty_points: 1, total_spent: 1 } });
+      if (c) customer = { loyalty_points: c.loyalty_points, total_spent: c.total_spent, visits: await db.count('reservations', { customer_id: resv.customer_id }) };
+    }
     res.json({ ...resv, history, payments, orders, customer });
   })
 );
@@ -153,10 +170,10 @@ r.post(
   ah(async (req, res) => {
     const input = { ...req.body };
     // Link to an existing customer account by phone/email when possible.
-    const cust = await db.one(
-      `SELECT c.id FROM customers c JOIN users u ON u.id = c.user_id WHERE u.phone = $1 OR ($2::text IS NOT NULL AND lower(u.email) = lower($2)) LIMIT 1`,
-      [input.phone, input.email || null]
-    );
+    const or = [{ phone: input.phone }];
+    if (input.email) or.push({ email: input.email });
+    const userIds = (await db.find('users', { $or: or }, { projection: { id: 1 }, collation: { locale: 'en', strength: 2 } })).map((u) => u.id);
+    const cust = userIds.length ? await db.findOne('customers', { user_id: { $in: userIds } }, { projection: { id: 1 } }) : null;
     input.customer_id = cust?.id || null;
     const created = await createReservation({ branchId: req.branchId, input, actor: req.user, admin: true, source: input.source });
     res.locals.createdId = created.id;
@@ -221,49 +238,47 @@ r.get(
   requirePerm('orders.view', 'orders.manage'),
   ah(async (req, res) => {
     const q = req.query;
-    const params = [req.branchId];
-    const where = ['o.branch_id = $1'];
+    const and = [{ branch_id: req.branchId }];
     if (q.q) {
-      params.push(`%${String(q.q).trim()}%`);
-      where.push(`(o.order_code ILIKE $${params.length} OR o.contact_name ILIKE $${params.length} OR o.contact_phone ILIKE $${params.length})`);
+      const rx = ilike(q.q);
+      and.push({ $or: [{ order_code: rx }, { contact_name: rx }, { contact_phone: rx }] });
     }
-    if (q.status === 'active') where.push(`o.status NOT IN ('completed','cancelled')`);
-    else if (q.status && ORDER_STATUSES.includes(q.status)) {
-      params.push(q.status);
-      where.push(`o.status = $${params.length}`);
-    }
-    if (q.type) {
-      params.push(q.type);
-      where.push(`o.order_type = $${params.length}`);
-    }
-    if (q.payment) {
-      params.push(q.payment);
-      where.push(`o.payment_status = $${params.length}`);
-    }
-    if (q.date) {
-      params.push(q.date);
-      where.push(`o.created_at::date = $${params.length}::date`);
-    }
-    if (q.from) {
-      params.push(q.from);
-      where.push(`o.created_at::date >= $${params.length}::date`);
-    }
-    if (q.to) {
-      params.push(q.to);
-      where.push(`o.created_at::date <= $${params.length}::date`);
+    if (q.status === 'active') and.push({ status: { $nin: ['completed', 'cancelled'] } });
+    else if (q.status && ORDER_STATUSES.includes(q.status)) and.push({ status: q.status });
+    if (q.type) and.push({ order_type: String(q.type) });
+    if (q.payment) and.push({ payment_status: String(q.payment) });
+    if (q.date) and.push({ created_at: { $gte: dayStart(q.date), $lt: nextDayStart(q.date) } });
+    if (q.from) and.push({ created_at: { $gte: dayStart(q.from) } });
+    if (q.to) and.push({ created_at: { $lt: nextDayStart(q.to) } });
+    const orders = await db.find('orders', and.length > 1 ? { $and: and } : and[0], { sort: { created_at: -1 }, limit: 500 });
+    if (!orders.length) return res.json([]);
+    const [tables, chefs, items] = await Promise.all([
+      db.mapByIds('tables', orders.map((o) => o.table_id), { projection: { table_number: 1 } }),
+      db.mapByIds('employees', orders.map((o) => o.assigned_chef_id), { projection: { name: 1 } }),
+      db.find('order_items', { order_id: { $in: orders.map((o) => o.id) } }, { sort: { id: 1 }, projection: { order_id: 1, name: 1, quantity: 1, notes: 1 } }),
+    ]);
+    const itemsBy = new Map();
+    for (const it of items) {
+      if (!itemsBy.has(it.order_id)) itemsBy.set(it.order_id, []);
+      itemsBy.get(it.order_id).push({ name: it.name, quantity: it.quantity, notes: it.notes ?? null });
     }
     res.json(
-      await db.many(
-        `SELECT o.*, t.table_number, e.name AS chef_name,
-                COALESCE((SELECT json_agg(json_build_object('name', oi.name, 'quantity', oi.quantity, 'notes', oi.notes) ORDER BY oi.id)
-                  FROM order_items oi WHERE oi.order_id = o.id), '[]'::json) AS items
-           FROM orders o LEFT JOIN tables t ON t.id = o.table_id LEFT JOIN employees e ON e.id = o.assigned_chef_id
-          WHERE ${where.join(' AND ')} ORDER BY o.created_at DESC LIMIT 500`,
-        params
-      )
+      orders.map((o) => ({
+        ...o,
+        table_number: tables.get(o.table_id)?.table_number ?? null,
+        chef_name: chefs.get(o.assigned_chef_id)?.name ?? null,
+        items: itemsBy.get(o.id) || [],
+      }))
     );
   })
 );
+
+/** Local-day bounds for `created_at::date` comparisons (restaurant timezone). */
+const dayStart = (s) => parseLocal(String(s).slice(0, 10));
+const nextDayStart = (s) => {
+  const d = dayStart(s);
+  return new Date(d.getFullYear(), d.getMonth(), d.getDate() + 1);
+};
 
 async function scopedOrder(req) {
   const o = await getOrder(pid(req)).catch(() => null);
@@ -276,7 +291,7 @@ r.get(
   requirePerm('orders.view', 'orders.manage'),
   ah(async (req, res) => {
     const o = await scopedOrder(req);
-    const payments = await db.many('SELECT * FROM payments WHERE order_id = $1 ORDER BY id', [o.id]);
+    const payments = await db.find('payments', { order_id: o.id }, { sort: { id: 1 } });
     res.json({ ...o, payments });
   })
 );
@@ -300,7 +315,8 @@ r.post(
   ah(async (req, res) => {
     const input = { ...req.body };
     if (input.contact_phone) {
-      const cust = await db.one('SELECT c.id FROM customers c JOIN users u ON u.id = c.user_id WHERE u.phone = $1', [input.contact_phone]);
+      const u = await db.findOne('users', { phone: input.contact_phone }, { projection: { id: 1 } });
+      const cust = u ? await db.findOne('customers', { user_id: u.id }, { projection: { id: 1 } }) : null;
       input.customer_id = cust?.id || null;
     }
     if (input.order_type === 'dine_in' && !input.table_id) throw badRequest('Select a table for dine-in orders');
@@ -326,10 +342,10 @@ r.patch(
   ah(async (req, res) => {
     const o = await scopedOrder(req);
     if (req.body.chef_id) {
-      const chef = await db.one(`SELECT id FROM employees WHERE id = $1 AND branch_id = $2 AND position = 'chef' AND status = 'active'`, [req.body.chef_id, req.branchId]);
+      const chef = await db.exists('employees', { id: req.body.chef_id, branch_id: req.branchId, position: 'chef', status: 'active' });
       if (!chef) throw badRequest('Select an active chef from this branch');
     }
-    await db.query('UPDATE orders SET assigned_chef_id = $2, updated_at = now() WHERE id = $1', [o.id, req.body.chef_id || null]);
+    await db.update('orders', { id: o.id }, { $set: { assigned_chef_id: req.body.chef_id || null, updated_at: new Date() } });
     // Assigning to the kitchen moves a confirmed order into preparation.
     if (req.body.chef_id && o.status === 'confirmed') {
       return res.json(await changeOrderStatus({ id: o.id, status: 'preparing', actor: req.user, branchId: req.branchId }));

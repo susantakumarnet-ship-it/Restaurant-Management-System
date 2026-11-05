@@ -16,9 +16,21 @@ export const ORDER_TRANSITIONS = {
   cancelled: [],
 };
 
+const CI = { locale: 'en', strength: 2 }; // case-insensitive (replacement for upper(code) = upper($1))
+
+/** FK existence check (PostgreSQL used to reject dangling references with 23503 -> 409 IN_USE). */
+async function mustExist(col, id) {
+  if (id == null) return;
+  if (!(await db.exists(col, { id: Number(id) }))) {
+    const e = new Error('This record is referenced by other data and cannot be removed or linked.');
+    e.code = 'IN_USE';
+    throw e;
+  }
+}
+
 /** Validate a coupon for a subtotal. Returns { coupon, discount } or throws a 400 with the reason. */
-export async function evaluateCoupon(q, { restaurantId, code, subtotal, customerId }) {
-  const c = await q.one(`SELECT * FROM coupons WHERE restaurant_id = $1 AND upper(code) = upper($2)`, [restaurantId, code.trim()]);
+export async function evaluateCoupon(q, { restaurantId, code, subtotal, customerId }) { // eslint-disable-line no-unused-vars
+  const c = await db.findOne('coupons', { restaurant_id: Number(restaurantId), code: String(code).trim() }, { collation: CI });
   if (!c || !c.is_active) throw badRequest('Invalid coupon code');
   const today = localDate();
   if (c.valid_from && today < c.valid_from) throw badRequest('This coupon is not active yet');
@@ -26,8 +38,8 @@ export async function evaluateCoupon(q, { restaurantId, code, subtotal, customer
   if (subtotal < Number(c.min_order_amount)) throw badRequest(`Minimum order of ₹${Number(c.min_order_amount)} required for this coupon`);
   if (c.usage_limit != null && c.used_count >= c.usage_limit) throw badRequest('This coupon has reached its usage limit');
   if (c.per_user_limit != null && customerId) {
-    const used = await q.one(`SELECT COUNT(*) AS n FROM orders WHERE coupon_id = $1 AND customer_id = $2 AND status <> 'cancelled'`, [c.id, customerId]);
-    if (used.n >= c.per_user_limit) throw badRequest('You have already used this coupon');
+    const used = await db.count('orders', { coupon_id: c.id, customer_id: Number(customerId), status: { $ne: 'cancelled' } });
+    if (used >= c.per_user_limit) throw badRequest('You have already used this coupon');
   }
   let discount = c.discount_type === 'percent' ? (subtotal * Number(c.discount_value)) / 100 : Number(c.discount_value);
   if (c.max_discount != null) discount = Math.min(discount, Number(c.max_discount));
@@ -43,11 +55,11 @@ export async function priceOrder(q, { branchId, items, couponCode, orderType, cu
   if (orderType === 'delivery' && !cfg.accepts_delivery) throw badRequest('This branch does not accept delivery orders');
   if (orderType === 'takeaway' && !cfg.accepts_takeaway) throw badRequest('This branch does not accept takeaway orders');
 
-  const ids = [...new Set(items.map((i) => i.food_item_id))];
-  const foods = await q.many(`SELECT * FROM food_items WHERE id = ANY($1::int[]) AND restaurant_id = $2`, [ids, cfg.restaurant_id]);
+  const ids = [...new Set(items.map((i) => Number(i.food_item_id)))];
+  const foods = await db.find('food_items', { id: { $in: ids }, restaurant_id: cfg.restaurant_id });
   const byId = new Map(foods.map((f) => [f.id, f]));
   const lines = items.map((i) => {
-    const f = byId.get(i.food_item_id);
+    const f = byId.get(Number(i.food_item_id));
     if (!f) throw badRequest('One of the items is no longer on the menu');
     if (!f.is_available) throw badRequest(`${f.name} is currently unavailable`);
     const unit = Number(f.discounted_price ?? f.price);
@@ -80,26 +92,35 @@ export async function priceOrder(q, { branchId, items, couponCode, orderType, cu
   };
 }
 
-export async function getOrder(id, q = db) {
-  const o = await q.one(
-    `SELECT o.*, b.name AS branch_name, b.address AS branch_address, b.phone AS branch_phone,
-            r.name AS restaurant_name, r.gstin, t.table_number, e.name AS chef_name,
-            cu.user_id, u.email AS customer_email, u.name AS customer_name,
-            inv.id AS invoice_id, inv.invoice_number,
-            COALESCE((SELECT json_agg(oi ORDER BY oi.id) FROM order_items oi WHERE oi.order_id = o.id), '[]'::json) AS items
-       FROM orders o
-       JOIN restaurant_branches b ON b.id = o.branch_id
-       JOIN restaurants r ON r.id = b.restaurant_id
-       LEFT JOIN tables t ON t.id = o.table_id
-       LEFT JOIN employees e ON e.id = o.assigned_chef_id
-       LEFT JOIN customers cu ON cu.id = o.customer_id
-       LEFT JOIN users u ON u.id = cu.user_id
-       LEFT JOIN invoices inv ON inv.order_id = o.id
-      WHERE o.id = $1`,
-    [id]
-  );
+export async function getOrder(id, q = db) { // eslint-disable-line no-unused-vars
+  const o = await db.byId('orders', id);
   if (!o) throw notFound('Order');
-  return o;
+  const b = await db.byId('restaurant_branches', o.branch_id);
+  if (!b) throw notFound('Order');
+  const r = await db.byId('restaurants', b.restaurant_id);
+  if (!r) throw notFound('Order');
+  const t = o.table_id != null ? await db.byId('tables', o.table_id, { projection: { table_number: 1 } }) : null;
+  const e = o.assigned_chef_id != null ? await db.byId('employees', o.assigned_chef_id, { projection: { name: 1 } }) : null;
+  const cu = o.customer_id != null ? await db.byId('customers', o.customer_id, { projection: { user_id: 1 } }) : null;
+  const u = cu?.user_id != null ? await db.byId('users', cu.user_id, { projection: { email: 1, name: 1 } }) : null;
+  const inv = await db.findOne('invoices', { order_id: o.id }, { projection: { id: 1, invoice_number: 1 } });
+  const items = await db.find('order_items', { order_id: o.id }, { sort: { id: 1 } });
+  return {
+    ...o,
+    branch_name: b.name,
+    branch_address: b.address,
+    branch_phone: b.phone,
+    restaurant_name: r.name,
+    gstin: r.gstin,
+    table_number: t ? t.table_number : null,
+    chef_name: e ? e.name : null,
+    user_id: cu ? cu.user_id : null,
+    customer_email: u ? u.email : null,
+    customer_name: u ? u.name : null,
+    invoice_id: inv ? inv.id : null,
+    invoice_number: inv ? inv.invoice_number : null,
+    items,
+  };
 }
 
 /**
@@ -111,48 +132,68 @@ export async function createOrder({ branchId, input, actor, staff = false }) {
   const customerId = staff ? input.customer_id || null : actor.customer_id;
   if (!staff && !customerId) throw forbidden('Only customer accounts can place online orders');
   if (input.order_type === 'delivery' && !input.delivery_address) throw badRequest('Delivery address is required');
+  const bid = Number(branchId);
 
-  const created = await db.tx(async (t) => {
-    const price = await priceOrder(t, { branchId, items: input.items, couponCode: input.coupon_code, orderType: input.order_type, customerId });
+  const created = await db.tx(async () => {
+    const price = await priceOrder(db, { branchId, items: input.items, couponCode: input.coupon_code, orderType: input.order_type, customerId });
     if (input.table_id) {
-      const tb = await t.one('SELECT id FROM tables WHERE id = $1 AND branch_id = $2', [input.table_id, branchId]);
+      const tb = await db.findOne('tables', { id: Number(input.table_id), branch_id: bid }, { projection: { id: 1 } });
       if (!tb) throw badRequest('Invalid table');
     }
     if (input.reservation_id) {
-      const rs = await t.one('SELECT id, customer_id FROM reservations WHERE id = $1 AND branch_id = $2', [input.reservation_id, branchId]);
+      const rs = await db.findOne('reservations', { id: Number(input.reservation_id), branch_id: bid }, { projection: { id: 1, customer_id: 1 } });
       if (!rs || (!staff && rs.customer_id !== customerId)) throw badRequest('Invalid reservation for pre-order');
     }
     if (price.coupon) {
-      const upd = await t.one(
-        `UPDATE coupons SET used_count = used_count + 1 WHERE id = $1 AND (usage_limit IS NULL OR used_count < usage_limit) RETURNING id`,
-        [price.coupon.id]
+      // Atomic claim: only increments while below the usage limit.
+      const upd = await db.findOneAndUpdate(
+        'coupons',
+        { id: price.coupon.id, $or: [{ usage_limit: null }, { $expr: { $lt: ['$used_count', '$usage_limit'] } }] },
+        { $inc: { used_count: 1 } },
+        { projection: { id: 1 } }
       );
       if (!upd) throw conflict('This coupon has just reached its usage limit');
     }
-    let order;
-    for (let i = 0; i < 5 && !order; i++) {
-      order = await t.one(
-        `INSERT INTO orders(order_code, branch_id, customer_id, reservation_id, table_id, order_type, status, subtotal, discount,
-             coupon_id, coupon_code, tax, service_charge, delivery_charge, total, contact_name, contact_phone, delivery_address,
-             notes, payment_method, created_by)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21)
-         ON CONFLICT (order_code) DO NOTHING RETURNING id`,
-        [
-          makeCode('OD'), branchId, customerId, input.reservation_id || null, input.table_id || null, input.order_type,
-          staff ? 'confirmed' : 'pending', price.subtotal, price.discount, price.coupon?.id || null, price.coupon?.code || null,
-          price.tax, price.service_charge, price.delivery_charge, price.total, input.contact_name || actor?.name || null,
-          input.contact_phone || actor?.phone || null, input.delivery_address || null, input.notes || null,
-          input.payment_method || null, actor?.id || null,
-        ]
-      );
-    }
-    for (const l of price.lines) {
-      await t.query(
-        `INSERT INTO order_items(order_id, food_item_id, name, unit_price, quantity, line_total, notes) VALUES ($1,$2,$3,$4,$5,$6,$7)`,
-        [order.id, l.food_item_id, l.name, l.unit_price, l.quantity, l.line_total, l.notes]
-      );
-    }
-    if (input.table_id && input.order_type === 'dine_in') await t.query(`UPDATE tables SET status = 'occupied' WHERE id = $1 AND status = 'available'`, [input.table_id]);
+    await mustExist('customers', customerId);
+    // A duplicate key inside a transaction aborts it, so pick a free code first (ON CONFLICT DO NOTHING retry).
+    let code = makeCode('OD');
+    for (let i = 0; i < 4 && (await db.exists('orders', { order_code: code })); i++) code = makeCode('OD');
+    const order = await db.insert('orders', {
+      order_code: code,
+      branch_id: bid,
+      customer_id: customerId != null ? Number(customerId) : null,
+      reservation_id: input.reservation_id ? Number(input.reservation_id) : null,
+      table_id: input.table_id ? Number(input.table_id) : null,
+      order_type: input.order_type,
+      status: staff ? 'confirmed' : 'pending',
+      subtotal: price.subtotal,
+      discount: price.discount,
+      coupon_id: price.coupon?.id || null,
+      coupon_code: price.coupon?.code || null,
+      tax: price.tax,
+      service_charge: price.service_charge,
+      delivery_charge: price.delivery_charge,
+      total: price.total,
+      contact_name: input.contact_name || actor?.name || null,
+      contact_phone: input.contact_phone || actor?.phone || null,
+      delivery_address: input.delivery_address || null,
+      notes: input.notes || null,
+      payment_method: input.payment_method || null,
+      created_by: actor?.id || null,
+    });
+    await db.insertMany(
+      'order_items',
+      price.lines.map((l) => ({
+        order_id: order.id,
+        food_item_id: l.food_item_id,
+        name: l.name,
+        unit_price: l.unit_price,
+        quantity: l.quantity,
+        line_total: l.line_total,
+        notes: l.notes,
+      }))
+    );
+    if (input.table_id && input.order_type === 'dine_in') await db.update('tables', { id: Number(input.table_id), status: 'available' }, { status: 'occupied' });
     return order;
   });
 
@@ -197,33 +238,39 @@ export async function changeOrderStatus({ id, status, actor, branchId, reason, b
   const balance = Math.round((Number(o.total) - Number(o.amount_paid)) * 100) / 100;
   if (status === 'completed' && balance > 0) throw badRequest(`Collect the outstanding ₹${balance} before completing this order`);
 
-  await db.tx(async (t) => {
-    const cur = await t.one('SELECT status FROM orders WHERE id = $1 FOR UPDATE', [id]);
-    if (cur.status !== o.status) throw conflict('Order was updated by someone else. Please refresh.');
-    await t.query(
-      `UPDATE orders SET status = $2::varchar, cancel_reason = CASE WHEN $2::varchar = 'cancelled' THEN $3::text ELSE cancel_reason END, updated_at = now() WHERE id = $1`,
-      [id, status, reason || null]
-    );
+  await db.tx(async () => {
+    const set = { status, updated_at: new Date() };
+    if (status === 'cancelled') set.cancel_reason = reason || null;
+    // Guarded transition (replaces SELECT ... FOR UPDATE + status re-check).
+    const moved = await db.findOneAndUpdate('orders', { id: o.id, status: o.status }, { $set: set }, { projection: { id: 1 } });
+    if (!moved) throw conflict('Order was updated by someone else. Please refresh.');
     if (status === 'completed' && !o.loyalty_awarded && o.customer_id) {
-      const cfg = await getBranchConfig(o.branch_id, t);
-      const points = Math.floor(Number(o.total) / 100) * cfg.loyalty_points_per_100;
-      await t.query(`UPDATE customers SET loyalty_points = loyalty_points + $2, total_spent = total_spent + $3 WHERE id = $1`, [o.customer_id, points, o.total]);
-      await t.query('UPDATE orders SET loyalty_awarded = true WHERE id = $1', [id]);
+      const awarded = await db.findOneAndUpdate('orders', { id: o.id, loyalty_awarded: { $ne: true } }, { $set: { loyalty_awarded: true } }, { projection: { id: 1 } });
+      if (awarded) {
+        const cfg = await getBranchConfig(o.branch_id);
+        const points = Math.floor(Number(o.total) / 100) * cfg.loyalty_points_per_100;
+        const cust = await db.byId('customers', o.customer_id, { projection: { total_spent: 1 } });
+        if (cust) {
+          await db.update(
+            'customers',
+            { id: o.customer_id },
+            { $inc: { loyalty_points: points }, $set: { total_spent: round2(Number(cust.total_spent || 0) + Number(o.total)) } }
+          );
+        }
+      }
     }
-    if (status === 'cancelled' && o.coupon_id) await t.query('UPDATE coupons SET used_count = GREATEST(used_count - 1, 0) WHERE id = $1', [o.coupon_id]);
+    if (status === 'cancelled' && o.coupon_id) await db.update('coupons', { id: o.coupon_id, used_count: { $gt: 0 } }, { $inc: { used_count: -1 } });
     if (['completed', 'cancelled'].includes(status) && o.table_id && o.order_type === 'dine_in') {
-      const open = await t.one(`SELECT COUNT(*) AS n FROM orders WHERE table_id = $1 AND id <> $2 AND status NOT IN ('completed','cancelled')`, [o.table_id, id]);
-      const seated = await t.one(
-        `SELECT COUNT(*) AS n FROM reservation_tables rt JOIN reservations r ON r.id = rt.reservation_id WHERE rt.table_id = $1 AND rt.active AND r.status = 'seated'`,
-        [o.table_id]
-      );
-      if (open.n === 0 && seated.n === 0) await t.query(`UPDATE tables SET status = 'available' WHERE id = $1 AND status = 'occupied'`, [o.table_id]);
+      const open = await db.count('orders', { table_id: o.table_id, id: { $ne: o.id }, status: { $nin: ['completed', 'cancelled'] } });
+      const resIds = await db.distinct('reservation_tables', 'reservation_id', { table_id: o.table_id, active: true });
+      const seated = resIds.length ? await db.count('reservations', { id: { $in: resIds }, status: 'seated' }) : 0;
+      if (open === 0 && seated === 0) await db.update('tables', { id: o.table_id, status: 'occupied' }, { status: 'available' });
     }
   });
 
   if (status === 'cancelled' && Number(o.amount_paid) > 0) {
     const { refundOrderPayments } = await import('./payments.js');
-    await refundOrderPayments(id, actor, reason || 'Order cancelled');
+    await refundOrderPayments(o.id, actor, reason || 'Order cancelled');
   }
   const updated = await getOrder(id);
   const msg = ORDER_MSG[status]?.(updated);

@@ -21,14 +21,18 @@ r.get(
   '/context',
   ah(async (req, res) => {
     const u = req.user;
-    const branches =
-      u.role === 'super_admin'
-        ? await db.many(`SELECT b.id, b.name, b.city, r.id AS restaurant_id, r.name AS restaurant_name, r.logo_url FROM restaurant_branches b JOIN restaurants r ON r.id = b.restaurant_id ORDER BY r.id, b.id`)
-        : await db.many(
-            `SELECT b.id, b.name, b.city, r.id AS restaurant_id, r.name AS restaurant_name, r.logo_url FROM restaurant_branches b JOIN restaurants r ON r.id = b.restaurant_id
-              WHERE b.restaurant_id = $1 AND ($2::int IS NULL OR b.id = $2) ORDER BY b.id`,
-            [u.restaurant_id, u.branch_id]
-          );
+    let filter = null;
+    if (u.role === 'super_admin') filter = {};
+    else if (u.restaurant_id != null) filter = u.branch_id != null ? { restaurant_id: u.restaurant_id, id: u.branch_id } : { restaurant_id: u.restaurant_id };
+    const rows = filter ? await db.find('restaurant_branches', filter, { sort: { restaurant_id: 1, id: 1 }, projection: { id: 1, name: 1, city: 1, restaurant_id: 1 } }) : [];
+    const restaurants = await db.mapByIds('restaurants', rows.map((b) => b.restaurant_id), { projection: { name: 1, logo_url: 1 } });
+    // INNER JOIN restaurants; ORDER BY r.id, b.id (super admin) / b.id (single restaurant)
+    const branches = rows
+      .filter((b) => restaurants.has(b.restaurant_id))
+      .map((b) => {
+        const r = restaurants.get(b.restaurant_id);
+        return { id: b.id, name: b.name, city: b.city ?? null, restaurant_id: r.id, restaurant_name: r.name, logo_url: r.logo_url ?? null };
+      });
     res.json({
       user: publicUser(u),
       branches,

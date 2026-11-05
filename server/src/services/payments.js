@@ -8,7 +8,7 @@ import Razorpay from 'razorpay';
 import { config } from '../config.js';
 import { db } from '../db/index.js';
 import { badRequest, conflict, forbidden, notFound } from '../utils/http.js';
-import { makeCode, round2 } from '../utils/common.js';
+import { invalid, makeCode, round2 } from '../utils/common.js';
 import { notify } from './notify.js';
 
 let rzp = null;
@@ -18,25 +18,38 @@ const razorpay = () => {
   return rzp;
 };
 
+const PAID_STATUSES = ['success', 'partially_refunded'];
+
+/** COALESCE(SUM(amount - refunded_amount), 0) of the live payments for a reservation. */
+async function reservationPaid(reservationId) {
+  const [row] = await db.aggregate('payments', [
+    { $match: { reservation_id: Number(reservationId), status: { $in: PAID_STATUSES } } },
+    { $group: { _id: null, s: { $sum: { $subtract: [{ $ifNull: ['$amount', 0] }, { $ifNull: ['$refunded_amount', 0] }] } } } },
+  ]);
+  return round2(row?.s || 0);
+}
+
+const userIdOfCustomer = async (customerId) => {
+  if (customerId == null) return null;
+  const cu = await db.byId('customers', customerId, { projection: { user_id: 1 } });
+  return cu ? cu.user_id : null;
+};
+
 /** Outstanding amount for an order or reservation advance. */
-async function dueFor(q, { orderId, reservationId }) {
+async function dueFor(q, { orderId, reservationId }) { // eslint-disable-line no-unused-vars
   if (orderId) {
-    const o = await q.one(
-      `SELECT o.*, cu.user_id FROM orders o LEFT JOIN customers cu ON cu.id = o.customer_id WHERE o.id = $1`,
-      [orderId]
-    );
+    const o = await db.byId('orders', orderId);
     if (!o) throw notFound('Order');
+    o.user_id = await userIdOfCustomer(o.customer_id);
     if (o.status === 'cancelled') throw badRequest('This order has been cancelled');
     return { target: o, branchId: o.branch_id, userId: o.user_id, due: round2(Number(o.total) - Number(o.amount_paid)), purpose: 'order' };
   }
-  const r = await q.one(
-    `SELECT r.*, cu.user_id FROM reservations r LEFT JOIN customers cu ON cu.id = r.customer_id WHERE r.id = $1`,
-    [reservationId]
-  );
+  const r = await db.byId('reservations', reservationId);
   if (!r) throw notFound('Reservation');
+  r.user_id = await userIdOfCustomer(r.customer_id);
   if (['cancelled', 'rejected', 'no_show'].includes(r.status)) throw badRequest(`This booking is ${r.status}`);
-  const paid = await q.one(`SELECT COALESCE(SUM(amount - refunded_amount),0) AS s FROM payments WHERE reservation_id = $1 AND status IN ('success','partially_refunded')`, [reservationId]);
-  return { target: r, branchId: r.branch_id, userId: r.user_id, due: round2(Number(r.advance_amount) - Number(paid.s)), purpose: 'advance' };
+  const paid = await reservationPaid(r.id);
+  return { target: r, branchId: r.branch_id, userId: r.user_id, due: round2(Number(r.advance_amount) - paid), purpose: 'advance' };
 }
 
 /** Step 1 of online checkout: create a pending payment (+ Razorpay order). */
@@ -51,12 +64,21 @@ export async function createOnlinePayment({ orderId, reservationId, user }) {
     const rOrder = await client.orders.create({ amount: Math.round(d.due * 100), currency: 'INR', receipt: code, notes: { orderId: orderId || '', reservationId: reservationId || '' } });
     gatewayOrderId = rOrder.id;
   }
-  const p = await db.one(
-    `INSERT INTO payments(payment_code, branch_id, order_id, reservation_id, user_id, amount, method, status, purpose, gateway, gateway_order_id)
-     VALUES ($1,$2,$3,$4,$5,$6,'online','pending',$7,$8,$9) RETURNING *`,
-    [code, d.branchId, orderId || null, reservationId || null, user.id, d.due, d.purpose, client ? 'razorpay' : 'mock', gatewayOrderId]
-  );
-  const branch = await db.one(`SELECT r.name FROM restaurant_branches b JOIN restaurants r ON r.id = b.restaurant_id WHERE b.id = $1`, [d.branchId]);
+  const p = await db.insert('payments', {
+    payment_code: code,
+    branch_id: d.branchId,
+    order_id: orderId ? Number(orderId) : null,
+    reservation_id: reservationId ? Number(reservationId) : null,
+    user_id: user.id,
+    amount: d.due,
+    method: 'online',
+    status: 'pending',
+    purpose: d.purpose,
+    gateway: client ? 'razorpay' : 'mock',
+    gateway_order_id: gatewayOrderId,
+  });
+  const branch = await db.byId('restaurant_branches', d.branchId, { projection: { restaurant_id: 1 } });
+  const rest = branch ? await db.byId('restaurants', branch.restaurant_id, { projection: { name: 1 } }) : null;
   return {
     payment_id: p.id,
     payment_code: p.payment_code,
@@ -66,7 +88,7 @@ export async function createOnlinePayment({ orderId, reservationId, user }) {
     amount: Number(p.amount),
     amount_paise: Math.round(Number(p.amount) * 100),
     currency: 'INR',
-    name: branch?.name || 'Restaurant',
+    name: rest?.name || 'Restaurant',
     description: orderId ? `Order ${d.target.order_code}` : `Advance for booking ${d.target.booking_code}`,
     prefill: { name: user.name, email: user.email, contact: user.phone },
   };
@@ -74,7 +96,7 @@ export async function createOnlinePayment({ orderId, reservationId, user }) {
 
 /** Step 2: verify Razorpay signature and capture. */
 export async function verifyOnlinePayment({ paymentId, razorpay_order_id, razorpay_payment_id, razorpay_signature, user }) {
-  const p = await db.one('SELECT * FROM payments WHERE id = $1', [paymentId]);
+  const p = await db.byId('payments', paymentId);
   if (!p || p.user_id !== user.id) throw notFound('Payment');
   if (p.status === 'success') return p;
   if (p.gateway !== 'razorpay') throw badRequest('Not a Razorpay payment');
@@ -82,7 +104,7 @@ export async function verifyOnlinePayment({ paymentId, razorpay_order_id, razorp
   const expected = crypto.createHmac('sha256', config.payments.razorpayKeySecret).update(`${razorpay_order_id}|${razorpay_payment_id}`).digest('hex');
   const ok = expected.length === String(razorpay_signature).length && crypto.timingSafeEqual(Buffer.from(expected), Buffer.from(String(razorpay_signature)));
   if (!ok) {
-    await db.query(`UPDATE payments SET status = 'failed', notes = 'Signature verification failed' WHERE id = $1`, [p.id]);
+    await db.update('payments', { id: p.id }, { status: 'failed', notes: 'Signature verification failed' });
     throw badRequest('Payment verification failed');
   }
   return markPaymentSuccess(p.id, { gatewayPaymentId: razorpay_payment_id });
@@ -91,11 +113,11 @@ export async function verifyOnlinePayment({ paymentId, razorpay_order_id, razorp
 /** Mock gateway completion (only when Razorpay keys are not configured). */
 export async function completeMockPayment({ paymentId, success, user }) {
   if (config.payments.mode !== 'mock') throw forbidden('Mock payments are disabled');
-  const p = await db.one('SELECT * FROM payments WHERE id = $1', [paymentId]);
+  const p = await db.byId('payments', paymentId);
   if (!p || p.user_id !== user.id) throw notFound('Payment');
   if (p.status !== 'pending') return p;
   if (!success) {
-    await db.query(`UPDATE payments SET status = 'failed', notes = 'Payment cancelled or declined' WHERE id = $1`, [p.id]);
+    await db.update('payments', { id: p.id }, { status: 'failed', notes: 'Payment cancelled or declined' });
     throw badRequest('Payment failed or was cancelled');
   }
   return markPaymentSuccess(p.id, { gatewayPaymentId: `mockpay_${crypto.randomBytes(6).toString('hex')}` });
@@ -109,7 +131,7 @@ export async function handleWebhook(rawBody, signature) {
   const event = JSON.parse(rawBody.toString('utf8'));
   if (event.event === 'payment.captured') {
     const ent = event.payload?.payment?.entity;
-    const p = ent && (await db.one('SELECT * FROM payments WHERE gateway_order_id = $1', [ent.order_id]));
+    const p = ent && ent.order_id != null ? await db.findOne('payments', { gateway_order_id: ent.order_id }) : null;
     if (p && p.status === 'pending') await markPaymentSuccess(p.id, { gatewayPaymentId: ent.id });
   }
   return { ok: true };
@@ -117,54 +139,67 @@ export async function handleWebhook(rawBody, signature) {
 
 /** Apply a successful payment to its order/reservation inside a transaction. */
 export async function markPaymentSuccess(paymentId, { gatewayPaymentId } = {}) {
-  const res = await db.tx(async (t) => {
-    const p = await t.one('SELECT * FROM payments WHERE id = $1 FOR UPDATE', [paymentId]);
+  const res = await db.tx(async () => {
+    // SELECT ... FOR UPDATE: concurrent verify/webhook/mock completions serialise here (idempotent).
+    await db.lock('payments', { id: Number(paymentId) });
+    const p = await db.byId('payments', paymentId);
+    if (!p) throw notFound('Payment');
     if (p.status === 'success') return p;
-    const upd = await t.one(
-      `UPDATE payments SET status = 'success', paid_at = now(), gateway_payment_id = COALESCE($2, gateway_payment_id) WHERE id = $1 RETURNING *`,
-      [paymentId, gatewayPaymentId || null]
-    );
-    await applyToTarget(t, upd);
+    const set = { status: 'success', paid_at: new Date() };
+    if (gatewayPaymentId) set.gateway_payment_id = gatewayPaymentId;
+    const upd = await db.findOneAndUpdate('payments', { id: p.id }, { $set: set });
+    await applyToTarget(null, upd);
     return upd;
   });
   await afterPayment(res);
   return res;
 }
 
-async function applyToTarget(t, p) {
+async function applyToTarget(t, p) { // eslint-disable-line no-unused-vars
   if (p.order_id) {
-    const o = await t.one(
-      `UPDATE orders SET amount_paid = amount_paid + $2,
-          payment_status = CASE WHEN amount_paid + $2 >= total THEN 'paid' ELSE 'partially_paid' END,
-          payment_method = $3,
-          status = CASE WHEN status = 'pending' THEN 'confirmed' ELSE status END,
-          updated_at = now()
-        WHERE id = $1 RETURNING *`,
-      [p.order_id, p.amount, p.method]
-    );
-    if (o.payment_status === 'paid') await ensureInvoice(t, o.id);
+    await db.lock('orders', { id: p.order_id });
+    const cur = await db.byId('orders', p.order_id);
+    if (cur) {
+      const paid = round2(Number(cur.amount_paid) + Number(p.amount));
+      const o = await db.findOneAndUpdate(
+        'orders',
+        { id: cur.id },
+        {
+          $set: {
+            amount_paid: paid,
+            payment_status: paid >= Number(cur.total) ? 'paid' : 'partially_paid',
+            payment_method: p.method,
+            status: cur.status === 'pending' ? 'confirmed' : cur.status,
+            updated_at: new Date(),
+          },
+        }
+      );
+      if (o.payment_status === 'paid') await ensureInvoice(null, o.id);
+    }
   }
   if (p.reservation_id) {
-    const r = await t.one('SELECT * FROM reservations WHERE id = $1', [p.reservation_id]);
-    const paid = await t.one(`SELECT COALESCE(SUM(amount - refunded_amount),0) AS s FROM payments WHERE reservation_id = $1 AND status IN ('success','partially_refunded')`, [r.id]);
-    const ps = Number(paid.s) >= Number(r.advance_amount) ? 'paid' : 'partially_paid';
-    const s = await t.one('SELECT auto_confirm FROM restaurant_settings WHERE branch_id = $1', [r.branch_id]);
-    const confirm = ps === 'paid' && r.status === 'pending' && s?.auto_confirm;
-    await t.query(`UPDATE reservations SET payment_status = $2, status = CASE WHEN $3::boolean THEN 'confirmed' ELSE status END, updated_at = now() WHERE id = $1`, [r.id, ps, confirm]);
+    const r = await db.byId('reservations', p.reservation_id);
+    if (!r) return;
+    const paid = await reservationPaid(r.id);
+    const ps = paid >= Number(r.advance_amount) ? 'paid' : 'partially_paid';
+    const s = await db.findOne('restaurant_settings', { branch_id: r.branch_id }, { projection: { auto_confirm: 1 } });
+    const confirm = !!(ps === 'paid' && r.status === 'pending' && s?.auto_confirm);
+    const set = { payment_status: ps, updated_at: new Date() };
+    if (confirm) set.status = 'confirmed';
+    await db.update('reservations', { id: r.id }, { $set: set });
     if (confirm) {
-      await t.query(`INSERT INTO reservation_status_history(reservation_id, from_status, to_status, note) VALUES ($1,'pending','confirmed','Auto-confirmed after advance payment')`, [r.id]);
+      await db.insert('reservation_status_history', { reservation_id: r.id, from_status: 'pending', to_status: 'confirmed', note: 'Auto-confirmed after advance payment' });
     }
   }
 }
 
 async function afterPayment(p) {
-  const info = await db.one(
-    `SELECT u.id AS user_id, u.email, u.phone, COALESCE(o.order_code, r.booking_code) AS ref
-       FROM payments p LEFT JOIN orders o ON o.id = p.order_id LEFT JOIN reservations r ON r.id = p.reservation_id
-       LEFT JOIN customers cu ON cu.id = COALESCE(o.customer_id, r.customer_id) LEFT JOIN users u ON u.id = cu.user_id
-      WHERE p.id = $1`,
-    [p.id]
-  );
+  const o = p.order_id ? await db.byId('orders', p.order_id, { projection: { order_code: 1, customer_id: 1 } }) : null;
+  const r = p.reservation_id ? await db.byId('reservations', p.reservation_id, { projection: { booking_code: 1, customer_id: 1 } }) : null;
+  const customerId = o?.customer_id ?? r?.customer_id ?? null;
+  const userId = await userIdOfCustomer(customerId);
+  const u = userId != null ? await db.byId('users', userId, { projection: { id: 1, email: 1, phone: 1 } }) : null;
+  const info = { user_id: u ? u.id : null, email: u ? u.email : null, phone: u ? u.phone : null, ref: o?.order_code ?? r?.booking_code ?? null };
   await notify({
     userId: info?.user_id,
     branchId: p.branch_id,
@@ -184,21 +219,34 @@ async function afterPayment(p) {
 
 /** Staff records a cash/UPI/card payment at the counter (supports partial payments). */
 export async function recordManualPayment({ branchId, orderId, reservationId, amount, method, notes, actor }) {
-  const res = await db.tx(async (t) => {
-    if (orderId) await t.query('SELECT id FROM orders WHERE id = $1 FOR UPDATE', [orderId]);
-    else await t.query('SELECT id FROM reservations WHERE id = $1 FOR UPDATE', [reservationId]);
-    const d = await dueFor(t, { orderId, reservationId });
+  const res = await db.tx(async () => {
+    if (orderId) await db.lock('orders', { id: Number(orderId) });
+    else await db.lock('reservations', { id: Number(reservationId) });
+    const d = await dueFor(null, { orderId, reservationId });
     if (d.branchId !== branchId) throw notFound(orderId ? 'Order' : 'Reservation');
     if (d.due <= 0) throw badRequest('Nothing is due');
     const amt = round2(amount ?? d.due);
     if (amt <= 0) throw badRequest('Amount must be positive');
     if (amt > d.due) throw badRequest(`Amount exceeds the outstanding balance of ₹${d.due}`);
-    const p = await t.one(
-      `INSERT INTO payments(payment_code, branch_id, order_id, reservation_id, user_id, amount, method, status, is_partial, purpose, gateway, notes, recorded_by, paid_at)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,'success',$8,$9,'manual',$10,$11, now()) RETURNING *`,
-      [makeCode('PAY', 8), branchId, orderId || null, reservationId || null, d.userId || null, amt, method, amt < d.due, d.purpose, notes || null, actor.id]
-    );
-    await applyToTarget(t, p);
+    let code = makeCode('PAY', 8);
+    for (let i = 0; i < 4 && (await db.exists('payments', { payment_code: code })); i++) code = makeCode('PAY', 8);
+    const p = await db.insert('payments', {
+      payment_code: code,
+      branch_id: branchId,
+      order_id: orderId ? Number(orderId) : null,
+      reservation_id: reservationId ? Number(reservationId) : null,
+      user_id: d.userId || null,
+      amount: amt,
+      method,
+      status: 'success',
+      is_partial: amt < d.due,
+      purpose: d.purpose,
+      gateway: 'manual',
+      notes: notes || null,
+      recorded_by: actor.id,
+      paid_at: new Date(),
+    });
+    await applyToTarget(null, p);
     return p;
   });
   await afterPayment(res);
@@ -206,43 +254,51 @@ export async function recordManualPayment({ branchId, orderId, reservationId, am
 }
 
 /** Refund (full or partial). Razorpay payments are refunded through the gateway. */
-export async function refundPayment({ paymentId, amount, reason, actor, branchId }) {
-  const result = await db.tx(async (t) => {
-    const p = await t.one('SELECT * FROM payments WHERE id = $1 FOR UPDATE', [paymentId]);
+export async function refundPayment({ paymentId, amount, reason, actor, branchId }) { // eslint-disable-line no-unused-vars
+  // The gateway refund is an external side effect: remember it so a transaction retry never refunds twice.
+  let gatewayRefund = null;
+  const result = await db.tx(async () => {
+    await db.lock('payments', { id: Number(paymentId) });
+    const p = await db.byId('payments', paymentId);
     if (!p || (branchId && p.branch_id !== branchId)) throw notFound('Payment');
-    if (!['success', 'partially_refunded'].includes(p.status)) throw badRequest('Only successful payments can be refunded');
+    if (!PAID_STATUSES.includes(p.status)) throw badRequest('Only successful payments can be refunded');
     const refundable = round2(Number(p.amount) - Number(p.refunded_amount));
     const amt = round2(amount ?? refundable);
     if (amt <= 0 || amt > refundable) throw badRequest(`Refund amount must be between ₹0.01 and ₹${refundable}`);
     let reference = `RF-${crypto.randomBytes(5).toString('hex').toUpperCase()}`;
     if (p.gateway === 'razorpay' && p.gateway_payment_id && razorpay()) {
-      const rf = await razorpay().payments.refund(p.gateway_payment_id, { amount: Math.round(amt * 100), notes: { reason: reason || '' } });
-      reference = rf.id;
+      if (!gatewayRefund || gatewayRefund.amt !== amt) {
+        const rf = await razorpay().payments.refund(p.gateway_payment_id, { amount: Math.round(amt * 100), notes: { reason: reason || '' } });
+        gatewayRefund = { amt, id: rf.id };
+      }
+      reference = gatewayRefund.id;
     }
     const refunded = round2(Number(p.refunded_amount) + amt);
+    if (refunded > Number(p.amount)) throw invalid('Refunded amount cannot exceed the payment amount');
     const status = refunded >= Number(p.amount) ? 'refunded' : 'partially_refunded';
-    const upd = await t.one(
-      `UPDATE payments SET refunded_amount = $2, status = $3, refund_reference = $4, refund_reason = $5 WHERE id = $1 RETURNING *`,
-      [p.id, refunded, status, reference, reason || null]
+    const upd = await db.findOneAndUpdate(
+      'payments',
+      { id: p.id },
+      { $set: { refunded_amount: refunded, status, refund_reference: reference, refund_reason: reason || null } }
     );
     if (p.order_id) {
-      await t.query(
-        `UPDATE orders SET amount_paid = GREATEST(amount_paid - $2, 0),
-            payment_status = CASE WHEN amount_paid - $2 <= 0 THEN 'refunded' ELSE 'partially_refunded' END, updated_at = now()
-          WHERE id = $1`,
-        [p.order_id, amt]
-      );
+      await db.lock('orders', { id: p.order_id });
+      const o = await db.byId('orders', p.order_id, { projection: { amount_paid: 1 } });
+      if (o) {
+        const left = round2(Number(o.amount_paid) - amt);
+        await db.update('orders', { id: p.order_id }, {
+          $set: { amount_paid: Math.max(left, 0), payment_status: left <= 0 ? 'refunded' : 'partially_refunded', updated_at: new Date() },
+        });
+      }
     }
     if (p.reservation_id) {
-      const left = await t.one(`SELECT COALESCE(SUM(amount - refunded_amount),0) AS s FROM payments WHERE reservation_id = $1 AND status IN ('success','partially_refunded')`, [p.reservation_id]);
-      await t.query(`UPDATE reservations SET payment_status = $2, updated_at = now() WHERE id = $1`, [p.reservation_id, Number(left.s) <= 0 ? 'refunded' : 'partially_refunded']);
+      const left = await reservationPaid(p.reservation_id);
+      await db.update('reservations', { id: p.reservation_id }, { $set: { payment_status: left <= 0 ? 'refunded' : 'partially_refunded', updated_at: new Date() } });
     }
     return { payment: upd, amount: amt };
   });
-  const info = await db.one(
-    `SELECT u.id AS user_id, u.email, u.phone FROM payments p LEFT JOIN users u ON u.id = p.user_id WHERE p.id = $1`,
-    [paymentId]
-  );
+  const u = result.payment.user_id != null ? await db.byId('users', result.payment.user_id, { projection: { id: 1, email: 1, phone: 1 } }) : null;
+  const info = { user_id: u ? u.id : null, email: u ? u.email : null, phone: u ? u.phone : null };
   await notify({
     userId: info?.user_id,
     branchId: result.payment.branch_id,
@@ -257,28 +313,49 @@ export async function refundPayment({ paymentId, amount, reason, actor, branchId
 }
 
 export async function refundOrderPayments(orderId, actor, reason) {
-  const ps = await db.many(`SELECT id FROM payments WHERE order_id = $1 AND status IN ('success','partially_refunded')`, [orderId]);
+  const ps = await db.find('payments', { order_id: Number(orderId), status: { $in: PAID_STATUSES } }, { projection: { id: 1 } });
   for (const p of ps) await refundPayment({ paymentId: p.id, reason, actor }).catch((e) => console.error('[refund] order', e.message));
 }
 
 export async function refundReservationAdvance(reservationId, actor, reason) {
-  const ps = await db.many(`SELECT id FROM payments WHERE reservation_id = $1 AND status IN ('success','partially_refunded')`, [reservationId]);
+  const ps = await db.find('payments', { reservation_id: Number(reservationId), status: { $in: PAID_STATUSES } }, { projection: { id: 1 } });
   for (const p of ps) await refundPayment({ paymentId: p.id, reason, actor }).catch((e) => console.error('[refund] reservation', e.message));
 }
 
 /** Create the GST invoice for an order (idempotent). */
-export async function ensureInvoice(q, orderId) {
-  const existing = await q.one('SELECT * FROM invoices WHERE order_id = $1', [orderId]);
+export async function ensureInvoice(q, orderId) { // eslint-disable-line no-unused-vars
+  const oid = Number(orderId);
+  const existing = await db.findOne('invoices', { order_id: oid });
   if (existing) return existing;
-  const o = await q.one('SELECT * FROM orders WHERE id = $1', [orderId]);
+  const o = await db.byId('orders', oid);
   if (!o) throw notFound('Order');
   if (o.status === 'cancelled') throw conflict('Cannot invoice a cancelled order');
   const d = new Date();
   const number = `INV-${d.getFullYear()}${String(d.getMonth() + 1).padStart(2, '0')}-${String(o.id).padStart(6, '0')}`;
   const cgst = round2(Number(o.tax) / 2);
-  return q.one(
-    `INSERT INTO invoices(invoice_number, branch_id, order_id, reservation_id, customer_name, subtotal, discount, cgst, sgst, service_charge, delivery_charge, total)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) ON CONFLICT (order_id) DO UPDATE SET invoice_number = invoices.invoice_number RETURNING *`,
-    [number, o.branch_id, o.id, o.reservation_id, o.contact_name, o.subtotal, o.discount, cgst, round2(Number(o.tax) - cgst), o.service_charge, o.delivery_charge, o.total]
+  // INSERT ... ON CONFLICT (order_id) DO UPDATE ... RETURNING * -> upsert keyed on the unique order_id.
+  const id = await db.nextId('invoices');
+  return db.findOneAndUpdate(
+    'invoices',
+    { order_id: o.id },
+    {
+      $setOnInsert: {
+        id,
+        invoice_number: number,
+        branch_id: o.branch_id,
+        order_id: o.id,
+        reservation_id: o.reservation_id ?? null,
+        customer_name: o.contact_name ?? null,
+        subtotal: o.subtotal,
+        discount: o.discount ?? 0,
+        cgst,
+        sgst: round2(Number(o.tax) - cgst),
+        service_charge: o.service_charge ?? 0,
+        delivery_charge: o.delivery_charge ?? 0,
+        total: o.total,
+        issued_at: new Date(),
+      },
+    },
+    { upsert: true }
   );
 }

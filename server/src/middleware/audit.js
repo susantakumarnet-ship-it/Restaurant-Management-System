@@ -12,11 +12,16 @@ function redact(obj, depth = 0) {
 
 export async function writeAudit({ userId, branchId, action, entity, entityId, details, ip }) {
   try {
-    await db.query(
-      `INSERT INTO audit_logs(user_id, branch_id, action, entity, entity_id, details, ip)
-       VALUES ($1,$2,$3,$4,$5,$6::text::jsonb,$7)`,
-      [userId || null, branchId || null, action, entity || null, entityId != null ? String(entityId) : null, details ? JSON.stringify(redact(details)) : null, ip || null]
-    );
+    await db.insert('audit_logs', {
+      user_id: userId || null,
+      branch_id: branchId || null,
+      action,
+      entity: entity || null,
+      entity_id: entityId != null ? String(entityId) : null,
+      // JSON round-trip keeps the stored value identical to what the JSONB column held (no undefined/Date objects).
+      details: details ? JSON.parse(JSON.stringify(redact(details))) : null,
+      ip: ip || null,
+    });
   } catch (e) {
     console.error('[audit] failed', e.message);
   }

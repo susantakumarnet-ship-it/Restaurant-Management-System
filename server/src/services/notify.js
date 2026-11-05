@@ -67,11 +67,18 @@ async function sendWhatsApp(to, body) {
 }
 
 async function record(row) {
-  const r = await db.one(
-    `INSERT INTO notifications(user_id, branch_id, channel, type, title, message, recipient, status, link, is_read)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING id`,
-    [row.userId || null, row.branchId || null, row.channel, row.type, row.title, row.message, row.recipient || null, row.status, row.link || null, row.channel !== 'in_app']
-  );
+  const r = await db.insert('notifications', {
+    user_id: row.userId || null,
+    branch_id: row.branchId || null,
+    channel: row.channel,
+    type: row.type,
+    title: row.title,
+    message: row.message,
+    recipient: row.recipient || null,
+    status: row.status,
+    link: row.link || null,
+    is_read: row.channel !== 'in_app',
+  });
   return r.id;
 }
 
@@ -83,11 +90,11 @@ async function deliver(channel, sender, base, recipient) {
     .then(() => sender(recipient, channel === 'email' ? base.title : `${base.title}: ${base.message}`, base.message))
     .then(async (r) => {
       if (r.status === 'logged' && !config.isTest && !config.isProd) console.log(`[notify:${channel}] -> ${recipient} | ${base.title}: ${base.message}`);
-      await db.query('UPDATE notifications SET status = $1 WHERE id = $2', [r.status, id]).catch(() => {});
+      await db.update('notifications', { id }, { $set: { status: r.status } }).catch(() => {});
     })
     .catch(async (e) => {
       console.error(`[notify:${channel}] failed`, e.message);
-      await db.query(`UPDATE notifications SET status = 'failed', error = $1 WHERE id = $2`, [e.message.slice(0, 500), id]).catch(() => {});
+      await db.update('notifications', { id }, { $set: { status: 'failed', error: e.message.slice(0, 500) } }).catch(() => {});
     });
 }
 

@@ -45,7 +45,7 @@ export function createApp() {
   for (const p of ['/api/auth/login', '/api/auth/register', '/api/auth/forgot-password', '/api/auth/reset-password', '/api/auth/verify-otp', '/api/auth/resend-otp']) app.use(p, authLimiter);
 
   app.get('/api/health', ah(async (_req, res) => {
-    await db.one('SELECT 1 AS ok');
+    await db.ping();
     res.json({ status: 'ok', db: db.driver, time: new Date().toISOString() });
   }));
 
