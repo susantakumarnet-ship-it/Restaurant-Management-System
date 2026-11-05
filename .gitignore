@@ -5,3 +5,6 @@ server/data/
 server/uploads/
 server/backups/
 *.log
+
+.claude/
+.vscode/
