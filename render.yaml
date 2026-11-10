@@ -1,0 +1,31 @@
+# Render Blueprint: one web service that builds the React client and serves it from the API.
+# Render dashboard -> New -> Blueprint -> pick this repo. You'll be asked for MONGODB_URI.
+services:
+  - type: web
+    name: smart-rms
+    runtime: node
+    plan: free
+    rootDir: server
+    # devDependencies are needed to build the client (tsc, vite) even though NODE_ENV=production
+    buildCommand: cd ../client && npm ci --include=dev && npm run build && cd ../server && npm ci --omit=dev
+    startCommand: npm start
+    healthCheckPath: /api/health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: NODE_VERSION
+        value: "22"
+      - key: TZ
+        value: Asia/Kolkata
+      - key: MONGODB_URI
+        sync: false # paste your Atlas connection string when prompted (password @ -> %40)
+      - key: MONGODB_DB
+        value: rms
+      - key: JWT_SECRET
+        generateValue: true
+      - key: JWT_EXPIRES_IN
+        value: 1d
+      - key: AUTH_RATE_LIMIT_MAX
+        value: "30"
+      - key: SCHEDULER_ENABLED
+        value: "true"

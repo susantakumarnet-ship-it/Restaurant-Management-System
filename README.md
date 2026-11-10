@@ -177,6 +177,21 @@ docker compose exec app npm run seed # optional demo data
 ```
 The image builds the React app and serves it from the API, so a single container on one port serves everything.
 
+### Render (from GitHub)
+The repo includes a `render.yaml` Blueprint. It defines one web service that builds the client, serves it from the API, generates `JWT_SECRET`, and asks you for `MONGODB_URI`.
+1. In Atlas, go to *Network Access* and add `0.0.0.0/0`. Render's outbound IPs aren't fixed on the free plan; on paid plans you can allow the service's listed outbound IPs instead. If Atlas blocks the IP, the app logs `SSL alert number 80` / `Server selection timed out`.
+2. In Render, choose **New → Blueprint**, pick this repo, and paste your Atlas connection string for `MONGODB_URI`. Special characters in the password must be URL-encoded, e.g. `@` becomes `%40`.
+3. After the first deploy, open the service's **Shell** and run `npm run seed` to load the demo data and accounts. Change the demo passwords afterwards.
+
+To keep an existing manually created service, set these instead:
+- *Root Directory* `server`
+- *Build Command* `cd ../client && npm ci --include=dev && npm run build && cd ../server && npm ci --omit=dev`
+- *Start Command* `npm start`
+- *Health Check Path* `/api/health`
+- Environment variables `NODE_ENV=production`, `JWT_SECRET` (a long random string), `MONGODB_URI`, `MONGODB_DB=rms`, `TZ=Asia/Kolkata`
+
+The free plan's disk is wiped on every deploy, so uploaded images don't persist. Use cloud storage (see Manual step 6) or a Render disk.
+
 ### Manual
 1. Create a MongoDB Atlas cluster (any tier, including the free M0): add a database user, allow your server's IP under *Network Access*, then copy the driver connection string. Set `MONGODB_URI` (and optionally `MONGODB_DB`, default `rms`), `NODE_ENV=production`, `JWT_SECRET`, `TZ` and `CLIENT_URL`. The API refuses to start in production without `MONGODB_URI`.
 2. Build the client: `cd client && npm ci && npm run build`. The API serves `client/dist` automatically. Alternatively, host `dist/` on a CDN and set `VITE_API_URL` before building.
