@@ -3,6 +3,7 @@ import { Link } from 'react-router-dom';
 import { ArrowRight, CalendarCheck, Clock, MapPin, Phone, ShoppingBag, Star, TicketPercent, Copy, Navigation } from 'lucide-react';
 import { toast } from 'sonner';
 import { api } from '../../lib/api';
+import { HOME_BG } from '../../lib/images';
 import { fmtTime, money, timeAgo } from '../../lib/format';
 import type { Coupon, FoodItem, Review, Category } from '../../lib/types';
 import { useApi } from '../../hooks/useApi';
@@ -27,7 +28,8 @@ export default function Home() {
   if (loadingBranch && !branch) return <Spinner className="h-[60vh]" />;
   if (!branch) return <EmptyState className="py-32" title="No restaurants available" description="Please check back soon." />;
 
-  const gallery = branch.images?.length ? branch.images : [branch.cover_url].filter(Boolean) as string[];
+  // The home background photo always comes first; branch photos follow in the gallery.
+  const gallery = [HOME_BG, ...((branch.images?.length ? branch.images : [branch.cover_url]).filter((u): u is string => !!u && u !== HOME_BG))];
   const isOpenNow = (() => {
     const now = new Date();
     const hm = now.toTimeString().slice(0, 5);

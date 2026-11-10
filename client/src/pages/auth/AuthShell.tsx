@@ -2,6 +2,7 @@ import type { ReactNode } from 'react';
 import { Link } from 'react-router-dom';
 import { useShop } from '../../context/ShopContext';
 import { Img } from '../../components/ui';
+import { HOME_BG } from '../../lib/images';
 
 /** Split-screen layout for auth pages with food imagery. */
 export function AuthShell({ title, subtitle, children }: { title: string; subtitle?: ReactNode; children: ReactNode }) {
@@ -9,7 +10,7 @@ export function AuthShell({ title, subtitle, children }: { title: string; subtit
   return (
     <div className="grid min-h-screen lg:grid-cols-2">
       <div className="relative hidden overflow-hidden bg-ink-900 lg:block">
-        <Img src={branch?.cover_url || branch?.images?.[0] || 'https://images.unsplash.com/photo-1414235077428-338989a2e8c0?auto=format&fit=crop&w=1400&q=70'} alt="" className="absolute inset-0 h-full w-full opacity-60" />
+        <Img src={HOME_BG} alt="" className="absolute inset-0 h-full w-full opacity-60" />
         <div className="absolute inset-0 bg-gradient-to-t from-ink-950 via-ink-950/40 to-transparent" />
         <div className="relative flex h-full flex-col justify-between p-12 text-white">
           <Link to="/" className="flex items-center gap-2">
