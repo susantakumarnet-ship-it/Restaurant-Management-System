@@ -1,5 +1,6 @@
 import 'dotenv/config';
 import path from 'node:path';
+import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -67,8 +68,14 @@ export const config = {
   // Return OTP codes in API responses (never in production) to make local testing easy
   exposeOtp: env.EXPOSE_OTP ? env.EXPOSE_OTP === 'true' : env.NODE_ENV !== 'production',
   schedulerEnabled: !isTest && env.SCHEDULER_ENABLED !== 'false',
+  // Load demo data on first start when the database has no restaurants (set SEED_ON_EMPTY=false to disable).
+  seedOnEmpty: env.SEED_ON_EMPTY !== 'false',
 };
 
 if (config.isProd && config.jwtSecret.startsWith('dev-')) {
-  throw new Error('JWT_SECRET must be set in production');
+  if (!config.mongoUri) throw new Error('JWT_SECRET (and MONGODB_URI) must be set in production');
+  // No JWT_SECRET: derive a stable secret from the database credentials so tokens survive restarts.
+  // Anyone able to reproduce it already holds the database password. Setting JWT_SECRET is still preferred.
+  config.jwtSecret = crypto.createHmac('sha256', config.mongoUri).update('smart-rms-jwt').digest('hex');
+  console.warn('[config] JWT_SECRET not set - using a secret derived from MONGODB_URI. Set JWT_SECRET to override.');
 }

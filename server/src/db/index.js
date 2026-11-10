@@ -37,7 +37,7 @@ export class DbError extends Error {
 export async function initDb({ uri = config.mongoUri, dbName = config.mongoDbName, dataDir = config.mongoDataDir } = {}) {
   if (database) return database;
   if (!uri) {
-    if (config.isProd) throw new Error('MONGODB_URI must be set in production');
+    if (config.isProd) throw new Error('MONGODB_URI must be set in production (e.g. your MongoDB Atlas connection string; URL-encode special characters in the password, @ -> %40)');
     const { MongoMemoryReplSet } = await import('mongodb-memory-server');
     const instanceOpts = [{ storageEngine: 'wiredTiger', ...(dataDir ? { dbPath: dataDir } : {}) }];
     if (dataDir) fs.mkdirSync(dataDir, { recursive: true });
