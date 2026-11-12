@@ -2,7 +2,7 @@ import { useMemo, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { ArrowRight, CalendarCheck, Clock, MapPin, Phone, ShoppingBag, Star, TicketPercent, Copy, Navigation } from 'lucide-react';
 import { toast } from 'sonner';
-import { api } from '../../lib/api';
+import { api, assetUrl } from '../../lib/api';
 import { HOME_BG } from '../../lib/images';
 import { fmtTime, money, timeAgo } from '../../lib/format';
 import type { Coupon, FoodItem, Review, Category } from '../../lib/types';
@@ -20,7 +20,6 @@ export default function Home() {
   const offers = useApi<Coupon[]>(branchId ? () => api.get(`/public/branches/${branchId}/offers`) : null, [branchId]);
   const reviews = useApi<Review[]>(branchId ? () => api.get(`/public/branches/${branchId}/reviews`) : null, [branchId]);
   const [open, setOpen] = useState<FoodItem | null>(null);
-  const [heroImg, setHeroImg] = useState(0);
 
   const popular = useMemo(() => [...(menu.data?.items || [])].filter((i) => i.is_available).sort((a, b) => Number(b.times_ordered || 0) - Number(a.times_ordered || 0)).slice(0, 4), [menu.data]);
   const recommended = useMemo(() => (menu.data?.items || []).filter((i) => i.is_recommended && i.is_available).slice(0, 4), [menu.data]);
@@ -28,8 +27,10 @@ export default function Home() {
   if (loadingBranch && !branch) return <Spinner className="h-[60vh]" />;
   if (!branch) return <EmptyState className="py-32" title="No restaurants available" description="Please check back soon." />;
 
-  // The home background photo always comes first; branch photos follow in the gallery.
-  const gallery = [HOME_BG, ...((branch.images?.length ? branch.images : [branch.cover_url]).filter((u): u is string => !!u && u !== HOME_BG))];
+  // Hero background: the restaurant's cover photo (falls back to the site default).
+  const heroBg = branch.cover_url || branch.images?.[0] || HOME_BG;
+  // Photo gallery: the branch photos other than the hero background.
+  const gallery = (branch.images || []).filter((u) => !!u && u !== heroBg);
   const isOpenNow = (() => {
     const now = new Date();
     const hm = now.toTimeString().slice(0, 5);
@@ -40,7 +41,7 @@ export default function Home() {
     <div>
       {/* Hero */}
       <section className="relative overflow-hidden bg-ink-950">
-        <Img src={gallery[heroImg] || branch.cover_url} alt={branch.restaurant_name} className="absolute inset-0 h-full w-full opacity-50" />
+        <Img src={heroBg} alt={branch.restaurant_name} className="absolute inset-0 h-full w-full object-[center_40%] opacity-60" />
         <div className="absolute inset-0 bg-gradient-to-r from-ink-950 via-ink-950/70 to-transparent" />
         <div className="relative mx-auto max-w-7xl px-4 py-20 sm:px-6 md:py-28">
           <div className="max-w-2xl animate-fade-in">
@@ -73,15 +74,6 @@ export default function Home() {
               </Link>
             </div>
           </div>
-          {gallery.length > 1 && (
-            <div className="mt-12 flex gap-2">
-              {gallery.slice(0, 5).map((g, i) => (
-                <button key={g} onClick={() => setHeroImg(i)} className={`h-14 w-20 overflow-hidden rounded-lg ring-2 transition sm:h-16 sm:w-24 ${i === heroImg ? 'ring-brand-400' : 'ring-white/10 opacity-70 hover:opacity-100'}`} aria-label={`Show photo ${i + 1}`}>
-                  <Img src={g} alt="" className="h-full w-full" />
-                </button>
-              ))}
-            </div>
-          )}
         </div>
       </section>
 
@@ -118,6 +110,20 @@ export default function Home() {
           </div>
         </div>
       </section>
+
+      {/* Photo gallery */}
+      {gallery.length > 0 && (
+        <section className="mx-auto max-w-7xl px-4 pt-14 sm:px-6">
+          <SectionTitle eyebrow="Gallery" title={`Inside ${branch.restaurant_name}`} />
+          <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-6">
+            {gallery.map((g, i) => (
+              <a key={g} href={assetUrl(g)} target="_blank" rel="noreferrer" className="group block aspect-[4/3] overflow-hidden rounded-xl bg-ink-100 ring-1 ring-ink-200/70" aria-label={`Open photo ${i + 1}`}>
+                <Img src={g} alt="" className="h-full w-full transition duration-300 group-hover:scale-105" />
+              </a>
+            ))}
+          </div>
+        </section>
+      )}
 
       {/* Categories */}
       <section className="mx-auto max-w-7xl px-4 py-14 sm:px-6">
@@ -191,7 +197,7 @@ export default function Home() {
       {/* Book CTA */}
       <section className="mx-auto max-w-7xl px-4 py-14 sm:px-6">
         <div className="relative overflow-hidden rounded-3xl bg-ink-900">
-          <Img src={gallery[1] || gallery[0]} alt="" className="absolute inset-0 h-full w-full opacity-30" />
+          <Img src={heroBg} alt="" className="absolute inset-0 h-full w-full object-[center_40%] opacity-30" />
           <div className="relative grid gap-6 p-8 md:grid-cols-2 md:p-12">
             <div>
               <p className="text-sm font-semibold uppercase tracking-widest text-brand-400">Reservations</p>

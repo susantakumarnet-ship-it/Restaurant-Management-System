@@ -10,7 +10,7 @@ export function AuthShell({ title, subtitle, children }: { title: string; subtit
   return (
     <div className="grid min-h-screen lg:grid-cols-2">
       <div className="relative hidden overflow-hidden bg-ink-900 lg:block">
-        <Img src={HOME_BG} alt="" className="absolute inset-0 h-full w-full opacity-60" />
+        <Img src={branch?.cover_url || HOME_BG} alt="" className="absolute inset-0 h-full w-full object-[center_40%] opacity-60" />
         <div className="absolute inset-0 bg-gradient-to-t from-ink-950 via-ink-950/40 to-transparent" />
         <div className="relative flex h-full flex-col justify-between p-12 text-white">
           <Link to="/" className="flex items-center gap-2">

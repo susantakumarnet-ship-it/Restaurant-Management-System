@@ -15,6 +15,8 @@ const rand = () => ((seedState = (seedState * 1664525 + 1013904223) % 4294967296
 const pick = (arr) => arr[Math.floor(rand() * arr.length)];
 const between = (a, b) => a + Math.floor(rand() * (b - a + 1));
 
+// Rooftop London's own photos (client/public/photos), served by the web app.
+const ROOFTOP_PHOTOS = ['/photos/rooftop-terrace.webp', '/photos/terrace-night.jpg', '/photos/lounge-night.jpg', '/photos/food-platter.jpg', '/photos/bar-neon.jpg', '/photos/sign-night.jpg', '/photos/entrance-lights.jpg'];
 const U = (id, w = 800) => `https://images.unsplash.com/${id}?auto=format&fit=crop&w=${w}&q=70`;
 
 const MENU = {
@@ -119,11 +121,11 @@ export async function seed({ log = console.log } = {}) {
     {
       name: 'ROOFTOP LONDON CAFE & RESTAURANT', slug: 'rooftop-london-cafe-restaurant', cuisine: 'Modern Indian, Continental', plan: 'pro',
       description: 'A contemporary dining room celebrating regional Indian flavours with a modern twist. Fresh, seasonal ingredients, a clay-oven tandoor and a rooftop lounge with city views.',
-      logo: U('photo-1555396273-367ea4eb4db5', 300), cover: U('photo-1517248135467-4c7edcad34c4', 1600),
+      logo: '/photos/sign-night.jpg', cover: '/photos/rooftop-terrace.webp',
       email: 'hello@saffronsage.in', phone: '099384 85755', gstin: '29ABCDE1234F1Z5', admin: ['Anita Rao', 'admin@saffronsage.com', '9000000002'],
       branches: [
-        { name: 'Trisulia, Kataka', address: 'BAZAR, near ANDHRA BANK, Trisulia', city: 'Kataka', state: 'Odisha', postal: '754005', lat: null, lng: null, phone: '099384 85755', images: ['photo-1517248135467-4c7edcad34c4', 'photo-1414235077428-338989a2e8c0', 'photo-1552566626-52f8b828add9', 'photo-1559339352-11d035aa65de'] },
-        { name: 'Bandra West, Mumbai', address: '45, Hill Road, Bandra West', city: 'Mumbai', state: 'Maharashtra', postal: '400050', lat: 19.0544, lng: 72.8402, phone: '+912226401234', images: ['photo-1590846406792-0adc7f938f1d', 'photo-1414235077428-338989a2e8c0'] },
+        { name: 'Trisulia, Kataka', address: 'BAZAR, near ANDHRA BANK, Trisulia', city: 'Kataka', state: 'Odisha', postal: '754005', lat: null, lng: null, phone: '099384 85755', images: ROOFTOP_PHOTOS },
+        { name: 'Bandra West, Mumbai', address: '45, Hill Road, Bandra West', city: 'Mumbai', state: 'Maharashtra', postal: '400050', lat: 19.0544, lng: 72.8402, phone: '+912226401234', images: ROOFTOP_PHOTOS },
       ],
     },
     {
@@ -186,7 +188,7 @@ export async function seed({ log = console.log } = {}) {
       const br = await db.insert('restaurant_branches', {
         restaurant_id: rest.id, name: b.name, address: b.address, city: b.city, state: b.state, postal_code: b.postal, latitude: b.lat, longitude: b.lng,
         phone: b.phone, email: rs.email, opening_time: '11:00:00', closing_time: '23:00:00', weekly_holidays: ri === 1 ? [1] : [],
-        images: b.images.map((i) => U(i, 1200)),
+        images: b.images.map((i) => (i.startsWith('/') ? i : U(i, 1200))),
         map_url: `https://www.google.com/maps?q=${b.lat != null ? `${b.lat},${b.lng}` : encodeURIComponent(`${b.address}, ${b.city}, ${b.state} ${b.postal}`)}`,
       });
       branchIds.push({ id: br.id, restaurantId: rest.id, foods: foodIds, primary: ri === 0 && bi === 0 });

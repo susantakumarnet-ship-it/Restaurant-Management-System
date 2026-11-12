@@ -1,2 +1,2 @@
-/** Site-wide background photo (client/public/home-bg.jpg). Replace that file to change it. */
-export const HOME_BG = '/home-bg.jpg';
+/** Default background photo (client/public/photos). Used when a restaurant has no cover photo. */
+export const HOME_BG = '/photos/rooftop-terrace.webp';
