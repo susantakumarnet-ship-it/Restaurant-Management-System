@@ -18,7 +18,8 @@ export const config = {
 
   // Database: MONGODB_URI -> that MongoDB server (Atlas in production);
   // otherwise (dev only) a local MongoDB started by mongodb-memory-server, persisted in MONGO_DATA_DIR.
-  mongoUri: isTest ? '' : env.MONGODB_URI || '',
+  // DATABASE_URL is accepted as an alias (common hosting convention) when it holds a mongodb:// URI.
+  mongoUri: isTest ? '' : env.MONGODB_URI || (/^mongodb(\+srv)?:\/\//.test(env.DATABASE_URL || '') ? env.DATABASE_URL : '') || '',
   mongoDbName: env.MONGODB_DB || 'rms',
   mongoDataDir: isTest ? '' : env.MONGO_DATA_DIR ?? path.join(root, 'data', 'mongo'),
 
