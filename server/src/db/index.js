@@ -34,6 +34,29 @@ export class DbError extends Error {
   }
 }
 
+/**
+ * Percent-encode the username/password in a connection string, so a password pasted with raw
+ * special characters (e.g. "p@ss") still works. Already-encoded values are left unchanged.
+ */
+export function normalizeMongoUri(uri) {
+  const s = String(uri).trim();
+  const m = s.match(/^(mongodb(?:\+srv)?:\/\/)([^/?#]*)(.*)$/s);
+  if (!m) return s;
+  const [, scheme, authority, rest] = m;
+  const at = authority.lastIndexOf('@');
+  if (at < 0) return s;
+  const cred = authority.slice(0, at);
+  const host = authority.slice(at + 1);
+  const colon = cred.indexOf(':');
+  const enc = (v) => {
+    let decoded = v;
+    try { decoded = decodeURIComponent(v); } catch { /* raw % in password: encode as-is */ }
+    return encodeURIComponent(decoded);
+  };
+  const userinfo = colon < 0 ? enc(cred) : `${enc(cred.slice(0, colon))}:${enc(cred.slice(colon + 1))}`;
+  return `${scheme}${userinfo}@${host}${rest}`;
+}
+
 export async function initDb({ uri = config.mongoUri, dbName = config.mongoDbName, dataDir = config.mongoDataDir } = {}) {
   if (database) return database;
   if (!uri) {
@@ -47,6 +70,7 @@ export async function initDb({ uri = config.mongoUri, dbName = config.mongoDbNam
     driverName = dataDir ? 'mongodb-local' : 'mongodb-memory';
   } else {
     driverName = 'mongodb';
+    uri = normalizeMongoUri(uri);
   }
   client = new MongoClient(uri, { maxPoolSize: parseInt(process.env.DB_POOL_MAX || '10', 10) });
   await client.connect();
